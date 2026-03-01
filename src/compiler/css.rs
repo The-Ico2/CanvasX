@@ -15,13 +15,49 @@ use std::collections::HashMap;
 pub struct CssRule {
     /// Selector string.
     pub selector: String,
-    /// Parsed selector components.
-    pub selector_parts: Vec<SelectorPart>,
+    /// Parsed complex selector (list of compound selectors for descendant matching).
+    pub compound_selectors: Vec<CompoundSelector>,
     /// Property declarations.
     pub declarations: Vec<(String, String)>,
 }
 
-/// A part of a CSS selector.
+/// A compound CSS selector part (matches a single element).
+/// Multiple conditions must ALL match the same element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundSelector {
+    pub tag: Option<String>,
+    pub classes: Vec<String>,
+    pub id: Option<String>,
+    pub is_universal: bool,
+}
+
+impl CompoundSelector {
+    /// Check if this compound selector matches a node.
+    pub fn matches_node(&self, tag: Option<&str>, classes: &[String], html_id: Option<&str>) -> bool {
+        if self.is_universal {
+            return true;
+        }
+        if let Some(ref t) = self.tag {
+            if tag != Some(t.as_str()) {
+                return false;
+            }
+        }
+        for cls in &self.classes {
+            if !classes.contains(cls) {
+                return false;
+            }
+        }
+        if let Some(ref id) = self.id {
+            if html_id != Some(id.as_str()) {
+                return false;
+            }
+        }
+        // Must have at least one condition
+        self.tag.is_some() || !self.classes.is_empty() || self.id.is_some()
+    }
+}
+
+/// A part of a CSS selector (kept for backward compatibility).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectorPart {
     Tag(String),
@@ -34,8 +70,6 @@ pub enum SelectorPart {
 pub fn parse_css(source: &str) -> Vec<CssRule> {
     let mut rules = Vec::new();
     let mut pos = 0;
-    let bytes = source.as_bytes();
-
     // Strip comments
     let source = strip_comments(source);
     let bytes = source.as_bytes();
@@ -100,10 +134,10 @@ pub fn parse_css(source: &str) -> Vec<CssRule> {
         // Handle comma-separated selectors: "html, body" → two rules.
         let selector_group: Vec<&str> = selector.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         for sel in selector_group {
-            let selector_parts = parse_selector(sel);
+            let compound_selectors = parse_compound_selector(sel);
             rules.push(CssRule {
                 selector: sel.to_string(),
-                selector_parts,
+                compound_selectors,
                 declarations: declarations.clone(),
             });
         }
@@ -112,7 +146,98 @@ pub fn parse_css(source: &str) -> Vec<CssRule> {
     rules
 }
 
-/// Parse a CSS selector into parts.
+/// Parse a CSS selector string into a chain of compound selectors.
+/// Each compound matches a single element; the chain represents descendant combinators.
+///
+/// Examples:
+///   ".pnl h2"    → [Compound{classes:["pnl"]}, Compound{tag:"h2"}]
+///   ".cap.on"    → [Compound{classes:["cap","on"]}]
+///   "#mediaPanel h2" → [Compound{id:"mediaPanel"}, Compound{tag:"h2"}]
+///   "*"          → [Compound{universal:true}]
+fn parse_compound_selector(selector: &str) -> Vec<CompoundSelector> {
+    let mut chain = Vec::new();
+    for token in selector.split_whitespace() {
+        // Skip pseudo-elements: we don't render them, so the entire selector
+        // is unmatchable. Return empty chain (compound_selector_matches returns false).
+        let token = if token.contains("::") {
+            return Vec::new();
+        } else if let Some(idx) = token.find(':') {
+            // :root, :hover, etc. — keep the part before for matching
+            let before = &token[..idx];
+            if before.is_empty() {
+                // Pure pseudo like ":root"
+                chain.push(CompoundSelector {
+                    tag: Some(token.to_string()),
+                    classes: Vec::new(),
+                    id: None,
+                    is_universal: false,
+                });
+                continue;
+            }
+            before
+        } else {
+            token
+        };
+
+        if token.is_empty() {
+            continue;
+        }
+
+        if token == "*" {
+            chain.push(CompoundSelector {
+                tag: None, classes: Vec::new(), id: None, is_universal: true,
+            });
+            continue;
+        }
+
+        // Parse compound: "div.class1.class2#id" etc.
+        let mut compound = CompoundSelector {
+            tag: None, classes: Vec::new(), id: None, is_universal: false,
+        };
+
+        let mut pos = 0;
+        let chars: Vec<char> = token.chars().collect();
+        while pos < chars.len() {
+            match chars[pos] {
+                '.' => {
+                    pos += 1;
+                    let start = pos;
+                    while pos < chars.len() && chars[pos] != '.' && chars[pos] != '#' {
+                        pos += 1;
+                    }
+                    if pos > start {
+                        compound.classes.push(chars[start..pos].iter().collect());
+                    }
+                }
+                '#' => {
+                    pos += 1;
+                    let start = pos;
+                    while pos < chars.len() && chars[pos] != '.' && chars[pos] != '#' {
+                        pos += 1;
+                    }
+                    if pos > start {
+                        compound.id = Some(chars[start..pos].iter().collect());
+                    }
+                }
+                _ => {
+                    // Tag name
+                    let start = pos;
+                    while pos < chars.len() && chars[pos] != '.' && chars[pos] != '#' {
+                        pos += 1;
+                    }
+                    if pos > start {
+                        compound.tag = Some(chars[start..pos].iter().collect::<String>().to_lowercase());
+                    }
+                }
+            }
+        }
+
+        chain.push(compound);
+    }
+    chain
+}
+
+/// Parse a CSS selector into parts (legacy, kept for backward compat).
 fn parse_selector(selector: &str) -> Vec<SelectorPart> {
     let mut parts = Vec::new();
     for token in selector.split_whitespace() {
@@ -155,17 +280,11 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
         "display" => {
             style.display = match value {
                 "flex" => Display::Flex,
+                "grid" => Display::Grid,
+                "inline-grid" => Display::Grid,
                 "block" => Display::Block,
                 "inline-block" => Display::InlineBlock,
                 "inline" => Display::InlineBlock, // approximate
-                "grid" | "inline-grid" => {
-                    // Grid → flex fallback.  Use Column direction so children
-                    // stack vertically and get the full cross-axis width, which
-                    // is the closest approximation when we can't parse
-                    // grid-template-columns/rows.
-                    style.flex_direction = FlexDirection::Column;
-                    Display::Flex
-                }
                 "none" => Display::None,
                 _ => style.display,
             };
@@ -186,9 +305,22 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
             style.overflow = match value {
                 "visible" => Overflow::Visible,
                 "hidden" => Overflow::Hidden,
-                "scroll" => Overflow::Scroll,
+                "scroll" | "auto" => Overflow::Scroll,
                 _ => style.overflow,
             };
+        }
+        "overflow-x" | "overflow-y" => {
+            // Map overflow-x/overflow-y to our single overflow property.
+            // For a simple engine, we use the most restrictive setting.
+            let ov = match value {
+                "visible" => Overflow::Visible,
+                "hidden" => Overflow::Hidden,
+                "scroll" | "auto" => Overflow::Scroll,
+                _ => style.overflow,
+            };
+            if ov != Overflow::Visible {
+                style.overflow = ov;
+            }
         }
 
         // --- Dimensions ---
@@ -285,10 +417,74 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
             }
         }
         "flex-basis" => { style.flex_basis = parse_dimension(value); }
+
+        // `flex` shorthand:  flex: <grow> [<shrink>] [<basis>]
+        // Common patterns: `flex: 1`, `flex: 0 1 auto`, `flex: none`, `flex: auto`.
+        "flex" => {
+            match value {
+                "none" => {
+                    style.flex_grow = 0.0;
+                    style.flex_shrink = 0.0;
+                    style.flex_basis = Dimension::Auto;
+                }
+                "auto" => {
+                    style.flex_grow = 1.0;
+                    style.flex_shrink = 1.0;
+                    style.flex_basis = Dimension::Auto;
+                }
+                _ => {
+                    let parts: Vec<&str> = value.split_whitespace().collect();
+                    if let Some(g) = parts.first().and_then(|v| v.parse::<f32>().ok()) {
+                        style.flex_grow = g;
+                        // When flex shorthand has a unitless number, spec says
+                        // flex-basis defaults to 0% (not auto).
+                        style.flex_basis = Dimension::Percent(0.0);
+                    }
+                    if let Some(s) = parts.get(1).and_then(|v| v.parse::<f32>().ok()) {
+                        style.flex_shrink = s;
+                    }
+                    if let Some(b) = parts.get(2) {
+                        style.flex_basis = parse_dimension(b);
+                    }
+                }
+            }
+        }
+
         "gap" => {
             if let Some(v) = parse_px(value) {
                 style.gap = v;
             }
+        }
+
+        // --- Grid ---
+        "grid-template-columns" => {
+            style.grid_template_columns = parse_grid_template(value);
+        }
+        "grid-template-rows" => {
+            style.grid_template_rows = parse_grid_template(value);
+        }
+        "grid-column" => {
+            // e.g. "1 / -1", "1 / 3", "span 2", "auto"
+            let (start, end) = parse_grid_placement(value);
+            style.grid_column_start = start;
+            style.grid_column_end = end;
+        }
+        "grid-column-start" => {
+            style.grid_column_start = value.trim().parse::<i32>().unwrap_or(0);
+        }
+        "grid-column-end" => {
+            style.grid_column_end = parse_grid_line(value.trim());
+        }
+        "grid-row" => {
+            let (start, end) = parse_grid_placement(value);
+            style.grid_row_start = start;
+            style.grid_row_end = end;
+        }
+        "grid-row-start" => {
+            style.grid_row_start = value.trim().parse::<i32>().unwrap_or(0);
+        }
+        "grid-row-end" => {
+            style.grid_row_end = parse_grid_line(value.trim());
         }
 
         // --- Position offsets ---
@@ -332,12 +528,21 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
 
         // --- Border ---
         "border" => {
-            // Shorthand: 1px solid #color
+            // Shorthand: 1px solid #color  or  1px solid rgba(...)
+            // First extract width from the beginning.
             let parts: Vec<&str> = value.split_whitespace().collect();
             if let Some(width) = parts.first().and_then(|v| parse_px(v)) {
                 style.border_width = crate::cxrd::value::EdgeInsets::uniform(width);
             }
-            if let Some(color) = parts.last().and_then(|v| parse_color(v)) {
+            // Extract color: find the color portion (could be rgba(...) spanning multiple whitespace-split parts).
+            let color_start = value.find("rgba(")
+                .or_else(|| value.find("rgb("))
+                .or_else(|| value.find('#'));
+            if let Some(start) = color_start {
+                if let Some(c) = parse_color(&value[start..]) {
+                    style.border_color = c;
+                }
+            } else if let Some(color) = parts.last().and_then(|v| parse_color(v)) {
                 style.border_color = color;
             }
         }
@@ -353,18 +558,18 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
         }
         "border-radius" => {
             // Shorthand: uniform or per-corner
-            let parts: Vec<&str> = value.split_whitespace().collect();
+            let parts = split_css_function_aware(value);
             match parts.len() {
                 1 => {
-                    if let Some(v) = parse_px(parts[0]) {
+                    if let Some(v) = parse_px(&parts[0]) {
                         style.border_radius = crate::cxrd::value::CornerRadii::uniform(v);
                     }
                 }
                 4 => {
-                    let tl = parse_px(parts[0]).unwrap_or(0.0);
-                    let tr = parse_px(parts[1]).unwrap_or(0.0);
-                    let br = parse_px(parts[2]).unwrap_or(0.0);
-                    let bl = parse_px(parts[3]).unwrap_or(0.0);
+                    let tl = parse_px(&parts[0]).unwrap_or(0.0);
+                    let tr = parse_px(&parts[1]).unwrap_or(0.0);
+                    let br = parse_px(&parts[2]).unwrap_or(0.0);
+                    let bl = parse_px(&parts[3]).unwrap_or(0.0);
                     style.border_radius = crate::cxrd::value::CornerRadii { top_left: tl, top_right: tr, bottom_right: br, bottom_left: bl };
                 }
                 _ => {}
@@ -378,7 +583,9 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
             }
         }
         "font-family" => {
-            let family = value.trim_matches(|c: char| c == '"' || c == '\'');
+            // Extract the first font family from comma-separated list.
+            let first = value.split(',').next().unwrap_or(value);
+            let family = first.trim().trim_matches(|c: char| c == '"' || c == '\'');
             style.font_family = family.to_string();
         }
         "font-size" => {
@@ -412,9 +619,23 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
             };
         }
         "letter-spacing" => {
-            if let Some(v) = parse_px(value) {
+            if let Some(em_str) = value.strip_suffix("em") {
+                // em-based letter-spacing: resolve relative to font-size.
+                if let Ok(v) = em_str.trim().parse::<f32>() {
+                    style.letter_spacing = v * style.font_size;
+                }
+            } else if let Some(v) = parse_px(value) {
                 style.letter_spacing = v;
             }
+        }
+        "text-transform" => {
+            style.text_transform = match value {
+                "uppercase" => TextTransform::Uppercase,
+                "lowercase" => TextTransform::Lowercase,
+                "capitalize" => TextTransform::Capitalize,
+                "none" => TextTransform::None,
+                _ => style.text_transform,
+            };
         }
 
         // --- Visual ---
@@ -653,6 +874,13 @@ enum CalcToken {
 /// Parse a px value.
 fn parse_px(value: &str) -> Option<f32> {
     let value = value.trim();
+    // Handle calc() expressions.
+    if value.starts_with("calc(") {
+        if let Dimension::Px(v) = parse_dimension(value) {
+            return Some(v);
+        }
+        return None;
+    }
     if let Some(v) = value.strip_suffix("px") {
         v.trim().parse::<f32>().ok()
     } else {
@@ -732,26 +960,27 @@ fn parse_color_component(s: &str) -> Option<f32> {
 
 /// Parse a CSS shorthand with 1–4 values (margin, padding, etc.).
 fn parse_shorthand_4(value: &str) -> (Dimension, Dimension, Dimension, Dimension) {
-    let parts: Vec<&str> = value.split_whitespace().collect();
+    // Use function-aware split to respect calc() parentheses.
+    let parts = split_css_function_aware(value);
     match parts.len() {
         1 => {
-            let v = parse_dimension(parts[0]);
+            let v = parse_dimension(&parts[0]);
             (v, v, v, v)
         }
         2 => {
-            let tb = parse_dimension(parts[0]);
-            let lr = parse_dimension(parts[1]);
+            let tb = parse_dimension(&parts[0]);
+            let lr = parse_dimension(&parts[1]);
             (tb, lr, tb, lr)
         }
         3 => {
-            let t = parse_dimension(parts[0]);
-            let lr = parse_dimension(parts[1]);
-            let b = parse_dimension(parts[2]);
+            let t = parse_dimension(&parts[0]);
+            let lr = parse_dimension(&parts[1]);
+            let b = parse_dimension(&parts[2]);
             (t, lr, b, lr)
         }
         4 => {
-            (parse_dimension(parts[0]), parse_dimension(parts[1]),
-             parse_dimension(parts[2]), parse_dimension(parts[3]))
+            (parse_dimension(&parts[0]), parse_dimension(&parts[1]),
+             parse_dimension(&parts[2]), parse_dimension(&parts[3]))
         }
         _ => (Dimension::Px(0.0), Dimension::Px(0.0), Dimension::Px(0.0), Dimension::Px(0.0)),
     }
@@ -787,6 +1016,117 @@ pub fn resolve_var_pub(value: &str, variables: &HashMap<String, String>) -> Stri
         }
     }
     result
+}
+
+/// Parse a `grid-template-columns` or `grid-template-rows` value into track sizes.
+///
+/// Handles: `300px 1fr 300px`, `auto 1fr auto`,
+///          `calc(300 * 1px) 1fr calc(300 * 1px)`, `1fr 1fr`, `repeat(3, 1fr)`.
+fn parse_grid_template(value: &str) -> Vec<GridTrackSize> {
+    let value = value.trim();
+
+    // Handle repeat() — simple case: repeat(N, track)
+    if value.starts_with("repeat(") {
+        if let Some(inner) = value.strip_prefix("repeat(").and_then(|s| s.strip_suffix(')')) {
+            if let Some((count_str, track_str)) = inner.split_once(',') {
+                let count = count_str.trim().parse::<usize>().unwrap_or(1);
+                let track = parse_single_grid_track(track_str.trim());
+                return vec![track; count];
+            }
+        }
+    }
+
+    // Split on whitespace but respect calc() parentheses.
+    let tokens = split_css_function_aware(value);
+    tokens.iter().map(|t| parse_single_grid_track(t)).collect()
+}
+
+/// Parse a single grid track size value.
+fn parse_single_grid_track(value: &str) -> GridTrackSize {
+    let value = value.trim();
+    if value == "auto" {
+        return GridTrackSize::Auto;
+    }
+    if value == "min-content" {
+        return GridTrackSize::MinContent;
+    }
+    if value == "max-content" {
+        return GridTrackSize::MaxContent;
+    }
+    if let Some(fr_str) = value.strip_suffix("fr") {
+        if let Ok(v) = fr_str.trim().parse::<f32>() {
+            return GridTrackSize::Fr(v);
+        }
+    }
+    if let Some(pct_str) = value.strip_suffix('%') {
+        if let Ok(v) = pct_str.trim().parse::<f32>() {
+            return GridTrackSize::Percent(v);
+        }
+    }
+    // Try as a dimension (handles calc(), px, etc.)
+    match parse_dimension(value) {
+        Dimension::Px(v) => GridTrackSize::Px(v),
+        Dimension::Percent(v) => GridTrackSize::Percent(v),
+        _ => GridTrackSize::Auto,
+    }
+}
+
+/// Split a CSS value on whitespace, respecting parenthesized groups like `calc(...)`.
+fn split_css_function_aware(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+
+    for ch in value.chars() {
+        if ch == '(' {
+            depth += 1;
+            current.push(ch);
+        } else if ch == ')' {
+            depth -= 1;
+            current.push(ch);
+        } else if ch.is_ascii_whitespace() && depth == 0 {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                tokens.push(trimmed);
+            }
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        tokens.push(trimmed);
+    }
+    tokens
+}
+
+/// Parse a grid placement shorthand like "1 / -1", "1 / 3", "span 2", "auto".
+fn parse_grid_placement(value: &str) -> (i32, i32) {
+    let value = value.trim();
+    if value == "auto" {
+        return (0, 0);
+    }
+    if let Some((start_str, end_str)) = value.split_once('/') {
+        let start = parse_grid_line(start_str.trim());
+        let end = parse_grid_line(end_str.trim());
+        (start, end)
+    } else if value.starts_with("span") {
+        let span = value.strip_prefix("span").and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(1);
+        (0, span + 1000) // Encode span as > 1000 so layout can detect it
+    } else {
+        let line = parse_grid_line(value);
+        (line, 0)
+    }
+}
+
+/// Parse a single grid line number: "1", "-1", "auto", "span 2".
+fn parse_grid_line(value: &str) -> i32 {
+    let value = value.trim();
+    if value == "auto" {
+        return 0;
+    }
+    value.parse::<i32>().unwrap_or(0)
 }
 
 /// Strip CSS comments.

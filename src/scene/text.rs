@@ -5,7 +5,7 @@
 
 use crate::cxrd::document::CxrdDocument;
 use crate::cxrd::node::{NodeId, NodeKind};
-use crate::cxrd::style::{Display};
+use crate::cxrd::style::{Display, TextTransform};
 use glyphon::{Attrs, Buffer, Color as GlyphonColor, Family, Metrics, Shaping, TextArea, TextBounds, Weight};
 use std::collections::HashMap;
 
@@ -64,6 +64,28 @@ impl TextPainter {
         };
 
         if let Some(content) = text_content {
+            // Apply text-transform.
+            let content = match node.style.text_transform {
+                TextTransform::Uppercase => content.to_uppercase(),
+                TextTransform::Lowercase => content.to_lowercase(),
+                TextTransform::Capitalize => {
+                    content.split_whitespace()
+                        .map(|word| {
+                            let mut chars = word.chars();
+                            match chars.next() {
+                                Some(c) => {
+                                    let upper: String = c.to_uppercase().collect();
+                                    format!("{}{}", upper, chars.as_str())
+                                }
+                                None => String::new(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+                TextTransform::None => content,
+            };
+
             let style = &node.style;
             let rect = &node.layout.content_rect;
 

@@ -11,6 +11,7 @@ use crate::cxrd::value::{Color, Dimension, EdgeInsets, CornerRadii};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Display {
     Flex,
+    Grid,
     Block,
     InlineBlock,
     None,
@@ -134,6 +135,32 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// Text transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextTransform {
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+impl Default for TextTransform {
+    fn default() -> Self {
+        TextTransform::None
+    }
+}
+
+/// A CSS grid track size.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GridTrackSize {
+    Auto,
+    Px(f32),
+    Percent(f32),
+    Fr(f32),
+    MinContent,
+    MaxContent,
 }
 
 impl Default for TextAlign {
@@ -264,6 +291,14 @@ pub struct ComputedStyle {
     pub box_shadow: Vec<BoxShadow>,
     pub opacity: f32,
 
+    // --- Grid ---
+    pub grid_template_columns: Vec<GridTrackSize>,
+    pub grid_template_rows: Vec<GridTrackSize>,
+    pub grid_column_start: i32,  // 0 = auto, positive = line number, negative = from end
+    pub grid_column_end: i32,    // 0 = auto, -1 = last line
+    pub grid_row_start: i32,
+    pub grid_row_end: i32,
+
     // --- Typography ---
     pub color: Color,
     pub font_family: String,
@@ -272,6 +307,7 @@ pub struct ComputedStyle {
     pub line_height: f32,    // multiplier
     pub text_align: TextAlign,
     pub letter_spacing: f32,
+    pub text_transform: TextTransform,
 
     // --- Transitions ---
     pub transitions: Vec<TransitionDef>,
@@ -323,6 +359,12 @@ impl Default for ComputedStyle {
             flex_shrink: 1.0,
             flex_basis: Dimension::Auto,
             gap: 0.0,
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
+            grid_column_start: 0,
+            grid_column_end: 0,
+            grid_row_start: 0,
+            grid_row_end: 0,
             top: Dimension::Auto,
             right: Dimension::Auto,
             bottom: Dimension::Auto,
@@ -340,6 +382,7 @@ impl Default for ComputedStyle {
             line_height: 1.5,
             text_align: TextAlign::default(),
             letter_spacing: 0.0,
+            text_transform: TextTransform::default(),
             transitions: Vec::new(),
             z_index: 0,
         }

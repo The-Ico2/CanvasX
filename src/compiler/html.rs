@@ -12,8 +12,8 @@
 use crate::cxrd::document::{CxrdDocument, SceneType};
 use crate::cxrd::node::{CxrdNode, NodeKind, ImageFit, NodeId, EventBinding, EventAction};
 use crate::cxrd::input::{InputKind, TextInputType, ButtonVariant, CheckboxStyle};
-use crate::cxrd::style::ComputedStyle;
-use crate::compiler::css::{parse_css, apply_property, parse_color, CssRule, SelectorPart};
+use crate::cxrd::style::{ComputedStyle, FontWeight, TextAlign};
+use crate::compiler::css::{parse_css, apply_property, parse_color, CssRule, CompoundSelector};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -56,8 +56,10 @@ pub fn compile_html(
     let (root_children, _) = build_node_tree(&tokens, 0);
 
     // 4. Add nodes to document and apply CSS.
+    // Pass ancestor chain for descendant selector matching.
+    let root_ancestors: Vec<AncestorInfo> = Vec::new();
     for child in root_children {
-        let child_id = add_node_recursive(&mut doc, child, &rules, &variables);
+        let child_id = add_node_recursive(&mut doc, child, &rules, &variables, &root_ancestors);
         doc.add_child(doc.root, child_id);
     }
 
@@ -65,6 +67,11 @@ pub fn compile_html(
     if let Some(root) = doc.get_node_mut(doc.root) {
         apply_rules_to_node(root, &rules, &variables);
     }
+
+    // 6. CSS inheritance pass — propagate inheritable properties
+    //    (color, font-family, font-size, font-weight, line-height,
+    //     letter-spacing, text-align) from parent to child nodes.
+    propagate_inherited_styles(&mut doc);
 
     Ok(doc)
 }
@@ -106,6 +113,107 @@ fn extract_document_background(
     }
 }
 
+/// Propagate CSS-inherited properties from parent to child nodes.
+///
+/// In CSS, properties like `color`, `font-family`, `font-size`, `font-weight`,
+/// `line-height`, `letter-spacing`, and `text-align` are inherited.  If a child
+/// node doesn't have an explicitly-set value (still at default), it should
+/// inherit from its parent.
+///
+/// We do a depth-first traversal, carrying the parent's style down.
+fn propagate_inherited_styles(doc: &mut CxrdDocument) {
+    let defaults = ComputedStyle::default();
+    let root_id = doc.root;
+
+    // Collect root's inheritable props as initial values.
+    let root_inherited = {
+        let root = &doc.nodes[root_id as usize];
+        InheritedProps::from_style(&root.style)
+    };
+
+    let children: Vec<u32> = doc.nodes[root_id as usize].children.clone();
+    for child_id in children {
+        propagate_recursive(doc, child_id, &root_inherited, &defaults);
+    }
+}
+
+/// Inheritable CSS property bundle.
+#[derive(Clone)]
+struct InheritedProps {
+    color: crate::cxrd::value::Color,
+    font_family: String,
+    font_size: f32,
+    font_weight: FontWeight,
+    line_height: f32,
+    letter_spacing: f32,
+    text_align: TextAlign,
+}
+
+impl InheritedProps {
+    fn from_style(s: &ComputedStyle) -> Self {
+        Self {
+            color: s.color,
+            font_family: s.font_family.clone(),
+            font_size: s.font_size,
+            font_weight: s.font_weight,
+            line_height: s.line_height,
+            letter_spacing: s.letter_spacing,
+            text_align: s.text_align,
+        }
+    }
+}
+
+fn propagate_recursive(
+    doc: &mut CxrdDocument,
+    node_id: u32,
+    parent: &InheritedProps,
+    defaults: &ComputedStyle,
+) {
+    // Apply inherited values where the node still has the default.
+    {
+        let node = &mut doc.nodes[node_id as usize];
+        // Color: inherit if still at the default (WHITE).
+        if node.style.color == defaults.color {
+            node.style.color = parent.color;
+        }
+        // font-family: inherit if empty (default).
+        if node.style.font_family.is_empty() {
+            node.style.font_family = parent.font_family.clone();
+        }
+        // font-size: inherit if same as default (16.0).
+        if (node.style.font_size - defaults.font_size).abs() < 0.01 {
+            node.style.font_size = parent.font_size;
+        }
+        // font-weight: inherit if default.
+        if node.style.font_weight == defaults.font_weight {
+            node.style.font_weight = parent.font_weight;
+        }
+        // line-height: inherit if default (1.5).
+        if (node.style.line_height - defaults.line_height).abs() < 0.01 {
+            node.style.line_height = parent.line_height;
+        }
+        // letter-spacing: inherit if zero (default).
+        if node.style.letter_spacing.abs() < 0.001 {
+            node.style.letter_spacing = parent.letter_spacing;
+        }
+        // text-align: inherit if default.
+        if node.style.text_align == defaults.text_align {
+            node.style.text_align = parent.text_align;
+        }
+    }
+
+    // Build inherited props from this node's current (post-inheritance) style.
+    let my_inherited = {
+        let node = &doc.nodes[node_id as usize];
+        InheritedProps::from_style(&node.style)
+    };
+
+    let children: Vec<u32> = doc.nodes[node_id as usize].children.clone();
+    for child_id in children {
+        propagate_recursive(doc, child_id, &my_inherited, defaults);
+    }
+}
+
 /// A temporary parsed HTML node before adding to the document.
 struct ParsedNode {
     tag: String,
@@ -144,6 +252,16 @@ fn tokenize_html(source: &str) -> Vec<HtmlToken> {
                     pos += end + 3;
                     continue;
                 }
+            }
+
+            // Check for <!DOCTYPE ...> — skip entirely, it's not a renderable element.
+            if pos + 1 < bytes.len() && bytes[pos + 1] == b'!' {
+                // Skip to the closing >.
+                while pos < bytes.len() && bytes[pos] != b'>' {
+                    pos += 1;
+                }
+                if pos < bytes.len() { pos += 1; } // skip >
+                continue;
             }
 
             // Check for close tag
@@ -304,12 +422,21 @@ fn is_void_element(tag: &str) -> bool {
     matches!(tag, "img" | "br" | "hr" | "input" | "meta" | "link" | "source" | "svg" | "path" | "line" | "circle" | "rect" | "polyline" | "ellipse" | "polygon")
 }
 
+/// Info about an ancestor element, used for descendant selector matching.
+#[derive(Clone)]
+struct AncestorInfo {
+    tag: Option<String>,
+    classes: Vec<String>,
+    html_id: Option<String>,
+}
+
 /// Add a parsed node tree to the CXRD document.
 fn add_node_recursive(
     doc: &mut CxrdDocument,
     parsed: ParsedNode,
     rules: &[CssRule],
     variables: &HashMap<String, String>,
+    ancestors: &[AncestorInfo],
 ) -> NodeId {
     let kind = determine_node_kind(&parsed);
 
@@ -333,8 +460,12 @@ fn add_node_recursive(
         layout: Default::default(),
     };
 
-    // Apply CSS rules in order.
-    apply_rules_to_node(&mut node, rules, variables);
+    // Store HTML id in classes list (prefixed) for later lookup,
+    // but keep the raw id for selector matching.
+    let html_id = parsed.id.clone();
+
+    // Apply CSS rules in order with ancestor-aware matching.
+    apply_rules_to_node_with_ancestors(&mut node, &html_id, rules, variables, ancestors);
 
     // Apply inline styles (highest specificity).
     if !parsed.inline_style.is_empty() {
@@ -348,10 +479,18 @@ fn add_node_recursive(
 
     let node_id = doc.add_node(node);
 
+    // Build ancestor info for children.
+    let mut child_ancestors = ancestors.to_vec();
+    child_ancestors.push(AncestorInfo {
+        tag: Some(parsed.tag.clone()),
+        classes: parsed.classes.clone(),
+        html_id,
+    });
+
     // Add children (unless consumed by widget).
     if !skip_children {
         for child in parsed.children {
-            let child_id = add_node_recursive(doc, child, rules, variables);
+            let child_id = add_node_recursive(doc, child, rules, variables, &child_ancestors);
             doc.add_child(node_id, child_id);
         }
     }
@@ -570,14 +709,16 @@ fn determine_node_kind(parsed: &ParsedNode) -> NodeKind {
     }
 }
 
-/// Apply matching CSS rules to a node.
-fn apply_rules_to_node(
+/// Apply matching CSS rules to a node with ancestor context for descendant matching.
+fn apply_rules_to_node_with_ancestors(
     node: &mut CxrdNode,
+    html_id: &Option<String>,
     rules: &[CssRule],
     variables: &HashMap<String, String>,
+    ancestors: &[AncestorInfo],
 ) {
     for rule in rules {
-        if selector_matches(&rule.selector_parts, node) {
+        if compound_selector_matches(&rule.compound_selectors, node, html_id, ancestors) {
             for (prop, val) in &rule.declarations {
                 apply_property(&mut node.style, prop, val, variables);
             }
@@ -585,17 +726,60 @@ fn apply_rules_to_node(
     }
 }
 
-/// Check if a selector matches a node (simplified — no parent/ancestor matching).
-fn selector_matches(parts: &[SelectorPart], node: &CxrdNode) -> bool {
-    // For now, only match the last part (simplified specificity).
-    if let Some(last) = parts.last() {
-        match last {
-            SelectorPart::Universal => true,
-            SelectorPart::Tag(tag) => node.tag.as_deref() == Some(tag.as_str()),
-            SelectorPart::Class(class) => node.classes.contains(class),
-            SelectorPart::Id(id) => node.tag.as_deref() == Some(id.as_str()) || node.classes.contains(id),
-        }
-    } else {
-        false
+/// Apply matching CSS rules to a node (legacy, for root node without ancestors).
+fn apply_rules_to_node(
+    node: &mut CxrdNode,
+    rules: &[CssRule],
+    variables: &HashMap<String, String>,
+) {
+    let no_ancestors: Vec<AncestorInfo> = Vec::new();
+    apply_rules_to_node_with_ancestors(node, &None, rules, variables, &no_ancestors);
+}
+
+/// Check if a compound selector chain matches a node within its ancestor context.
+///
+/// The last compound selector must match the node itself.
+/// Earlier compound selectors must match ancestors (in order, not necessarily consecutive).
+fn compound_selector_matches(
+    selectors: &[CompoundSelector],
+    node: &CxrdNode,
+    html_id: &Option<String>,
+    ancestors: &[AncestorInfo],
+) -> bool {
+    if selectors.is_empty() {
+        return false;
     }
+
+    // The last compound must match the node itself.
+    let last = &selectors[selectors.len() - 1];
+    if !last.matches_node(
+        node.tag.as_deref(),
+        &node.classes,
+        html_id.as_deref(),
+    ) {
+        return false;
+    }
+
+    // If there's only one compound, we're done (simple selector).
+    if selectors.len() == 1 {
+        return true;
+    }
+
+    // Walk remaining selectors right-to-left, matching against ancestors.
+    // Descendant combinator: ancestor doesn't need to be direct parent.
+    let remaining = &selectors[..selectors.len() - 1];
+    let mut sel_idx = remaining.len() as i32 - 1;
+    let mut anc_idx = ancestors.len() as i32 - 1;
+
+    while sel_idx >= 0 && anc_idx >= 0 {
+        let sel = &remaining[sel_idx as usize];
+        let anc = &ancestors[anc_idx as usize];
+        if sel.matches_node(anc.tag.as_deref(), &anc.classes, anc.html_id.as_deref()) {
+            sel_idx -= 1;
+        }
+        anc_idx -= 1;
+    }
+
+    // All ancestor selectors must have been matched.
+    sel_idx < 0
 }
