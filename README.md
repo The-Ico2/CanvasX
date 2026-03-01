@@ -238,6 +238,8 @@ Apache 2.0 — see [LICENSE](LICENSE).
 
 Under active development (`v0.1.0`). APIs, document format, and behavior may change.
 
+> Currently this project is being developed for Sentinel, but in the future I intend to completely decouple this from Sentinel and make it its own thing for everyone to use if they wish.
+
 ---
 
 ## Contact
