@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use windows::core::PCWSTR;
 use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE, ERROR_PIPE_BUSY},
+    Foundation::{CloseHandle, HANDLE, ERROR_PIPE_BUSY, ERROR_MORE_DATA},
     Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAGS_AND_ATTRIBUTES,
@@ -199,17 +199,26 @@ pub fn send_ipc_request_to(pipe_name: &str, request: IpcRequest) -> Result<IpcRe
             return Err("IPC write failed".into());
         }
 
-        // Read response.
+        // Read response — handle messages larger than one chunk (ERROR_MORE_DATA).
         let mut response = Vec::new();
         let mut chunk = vec![0u8; READ_CHUNK];
-        let mut read = 0u32;
-        match ReadFile(handle, Some(&mut chunk), Some(&mut read), None) {
-            Ok(_) => {
-                response.extend_from_slice(&chunk[..read as usize]);
-            }
-            Err(_) => {
-                let _ = CloseHandle(handle);
-                return Err("IPC read failed".into());
+        loop {
+            let mut read = 0u32;
+            match ReadFile(handle, Some(&mut chunk), Some(&mut read), None) {
+                Ok(_) => {
+                    response.extend_from_slice(&chunk[..read as usize]);
+                    break; // complete message received
+                }
+                Err(e) => {
+                    let code = (e.code().0 & 0xFFFF) as u32;
+                    if code == ERROR_MORE_DATA.0 {
+                        // Partial message — append what we got and loop for more
+                        response.extend_from_slice(&chunk[..read as usize]);
+                        continue;
+                    }
+                    let _ = CloseHandle(handle);
+                    return Err("IPC read failed".into());
+                }
             }
         }
 

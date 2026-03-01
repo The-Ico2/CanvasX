@@ -54,6 +54,13 @@ pub enum NodeKind {
         value: f32,
     },
 
+    /// Stacked data bar: multiple segments share the same track.
+    /// Each segment occupies a proportion of the total bar width based on
+    /// its `value / max` ratio relative to the sum of all segments.
+    DataBarStack {
+        segments: Vec<BarSegment>,
+    },
+
     /// Scroll container.
     ScrollContainer {
         scroll_x: bool,
@@ -63,6 +70,16 @@ pub enum NodeKind {
     /// Interactive input widget (button, text field, slider, etc.).
     /// These make CanvasX documents usable as full application windows.
     Input(InputKind),
+}
+
+/// A single segment inside a DataBarStack.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BarSegment {
+    pub binding: String,
+    pub max: f32,
+    pub value: f32,
+    /// Fill color for this segment (RGBA).
+    pub color: [f32; 4],
 }
 
 /// Image fit mode (analogous to CSS object-fit).

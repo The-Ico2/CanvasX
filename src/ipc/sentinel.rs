@@ -80,7 +80,7 @@ impl Default for SentinelBridgeConfig {
                 "network", "wifi", "bluetooth", "audio", "keyboard",
                 "mouse", "power", "idle", "system", "media",
             ].into_iter().map(String::from).collect(),
-            poll_interval_ms: 50,
+            poll_interval_ms: 250,
             send_heartbeats: true,
         }
     }
@@ -267,7 +267,6 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
 
     let mut heartbeat_timer = Instant::now();
     let mut demands_sent = false;
-    let ipc_timeout = Duration::from_secs(5);
 
     loop {
         let interval = state.poll_interval_ms.load(Ordering::Relaxed);
@@ -286,13 +285,13 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
                     "set_tracking_demands",
                     json!({ "sections": sections }),
                 );
-                if send_ipc_request_with_timeout(&state.pipe_name, request, ipc_timeout).is_ok() {
+                if send_ipc_request_to(&state.pipe_name, request).is_ok() {
                     demands_sent = true;
                 }
             }
         }
 
-        // Fetch snapshot.
+        // Fetch snapshot (synchronous — one connection at a time).
         let sections = state.tracking_demands.lock().unwrap().clone();
         let request = IpcRequest::with_args(
             "registry",
@@ -300,8 +299,11 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
             json!({ "sections": sections }),
         );
 
-        match send_ipc_request_with_timeout(&state.pipe_name, request, ipc_timeout) {
+        match send_ipc_request_to(&state.pipe_name, request) {
             Ok(resp) if resp.ok => {
+                if !state.connected.load(Ordering::Relaxed) {
+                    log::info!("Sentinel bridge: connected");
+                }
                 state.connected.store(true, Ordering::Relaxed);
 
                 if let Some(data) = resp.data {
@@ -321,7 +323,9 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
                 state.connected.store(true, Ordering::Relaxed);
             }
             Err(e) => {
-                log::warn!("Sentinel bridge: snapshot failed: {}", e);
+                if state.connected.load(Ordering::Relaxed) {
+                    log::warn!("Sentinel bridge: connection lost ({})", e);
+                }
                 state.connected.store(false, Ordering::Relaxed);
                 demands_sent = false; // Re-send demands on reconnect.
                 thread::sleep(Duration::from_millis(1000));
@@ -331,10 +335,9 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
 
         // Heartbeat every 500ms.
         if state.send_heartbeats && heartbeat_timer.elapsed() >= Duration::from_millis(500) {
-            let _ = send_ipc_request_with_timeout(
+            let _ = send_ipc_request_to(
                 &state.pipe_name,
                 IpcRequest::new("backend", "ui_heartbeat"),
-                Duration::from_secs(2),
             );
             heartbeat_timer = Instant::now();
         }

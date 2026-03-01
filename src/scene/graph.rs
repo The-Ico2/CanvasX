@@ -112,10 +112,20 @@ impl SceneGraph {
     /// Update DataBar nodes with current data values.
     fn update_data_bars(&mut self) {
         for node in &mut self.document.nodes {
-            if let NodeKind::DataBar { ref binding, max, ref mut value } = node.kind {
-                if let Some(raw) = self.data_values.get(binding) {
-                    *value = raw.parse::<f32>().unwrap_or(0.0).clamp(0.0, max);
+            match &mut node.kind {
+                NodeKind::DataBar { ref binding, max, ref mut value } => {
+                    if let Some(raw) = self.data_values.get(binding) {
+                        *value = raw.parse::<f32>().unwrap_or(0.0).clamp(0.0, *max);
+                    }
                 }
+                NodeKind::DataBarStack { ref mut segments } => {
+                    for seg in segments.iter_mut() {
+                        if let Some(raw) = self.data_values.get(&seg.binding) {
+                            seg.value = raw.parse::<f32>().unwrap_or(0.0).clamp(0.0, seg.max);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }

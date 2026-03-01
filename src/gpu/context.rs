@@ -65,12 +65,16 @@ impl GpuContext {
         let device = Arc::new(device);
         let queue = Arc::new(queue);
 
-        // Pick surface format
+        // Pick surface format.
+        // Use a non-sRGB format so that premultiplied-alpha blending produces
+        // results consistent with CSS/browser compositing.  An sRGB format
+        // applies a linear→sRGB transfer *after* blending, which inflates
+        // low-alpha RGB values dramatically (the steep 12.92× segment).
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .copied()
             .unwrap_or(caps.formats[0]);
 
@@ -171,7 +175,7 @@ impl GpuContext {
         let surface_format = caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .copied()
             .unwrap_or(caps.formats[0]);
 

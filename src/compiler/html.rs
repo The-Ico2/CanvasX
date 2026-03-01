@@ -10,10 +10,10 @@
 // Attributes: class, id, style (inline), data-*, src, alt
 
 use crate::cxrd::document::{CxrdDocument, SceneType};
-use crate::cxrd::node::{CxrdNode, NodeKind, ImageFit, NodeId, EventBinding, EventAction};
+use crate::cxrd::node::{CxrdNode, NodeKind, ImageFit, NodeId, EventBinding, EventAction, BarSegment};
 use crate::cxrd::input::{InputKind, TextInputType, ButtonVariant, CheckboxStyle};
 use crate::cxrd::style::{ComputedStyle, Display, FlexDirection, FontWeight, TextAlign};
-use crate::compiler::css::{parse_css, apply_property, parse_color, CssRule, CompoundSelector};
+use crate::compiler::css::{parse_css, apply_property, parse_color, resolve_var_pub, CssRule, CompoundSelector};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -419,7 +419,7 @@ fn build_node_tree(tokens: &[HtmlToken], start: usize) -> (Vec<ParsedNode>, usiz
 }
 
 fn is_void_element(tag: &str) -> bool {
-    matches!(tag, "img" | "br" | "hr" | "input" | "meta" | "link" | "source" | "svg" | "path" | "line" | "circle" | "rect" | "polyline" | "ellipse" | "polygon" | "data-bind" | "data-bar")
+    matches!(tag, "img" | "br" | "hr" | "input" | "meta" | "link" | "source" | "svg" | "path" | "line" | "circle" | "rect" | "polyline" | "ellipse" | "polygon" | "data-bind" | "data-bar" | "data-bar-segment")
 }
 
 /// Info about an ancestor element, used for descendant selector matching.
@@ -439,14 +439,15 @@ fn add_node_recursive(
     ancestors: &[AncestorInfo],
     parent_style: Option<&ComputedStyle>,
 ) -> NodeId {
-    let kind = determine_node_kind(&parsed);
+    let kind = determine_node_kind(&parsed, variables);
 
     // For widget elements, children are consumed by the widget (label, options, etc.)
     // and should not be added as child scene nodes.
     let skip_children = matches!(&kind,
         NodeKind::Input(InputKind::Button { .. }) |
         NodeKind::Input(InputKind::Dropdown { .. }) |
-        NodeKind::Input(InputKind::TextArea { .. })
+        NodeKind::Input(InputKind::TextArea { .. }) |
+        NodeKind::DataBarStack { .. }
     );
 
     let mut style = ComputedStyle::default();
@@ -472,6 +473,14 @@ fn add_node_recursive(
         }
         // data-bar is a void progress bar element — block-level, height from CSS.
         "data-bar" => {
+            style.display = Display::Block;
+        }
+        // data-bar-stack is a container bar — children are data-bar-segment void elements.
+        "data-bar-stack" => {
+            style.display = Display::Block;
+        }
+        // data-bar-segment is a void element inside data-bar-stack (not rendered individually).
+        "data-bar-segment" => {
             style.display = Display::Block;
         }
         _ => {} // default Block
@@ -624,7 +633,7 @@ fn extract_event_bindings(parsed: &ParsedNode) -> Vec<EventBinding> {
 }
 
 /// Determine the NodeKind from the HTML element.
-fn determine_node_kind(parsed: &ParsedNode) -> NodeKind {
+fn determine_node_kind(parsed: &ParsedNode, variables: &HashMap<String, String>) -> NodeKind {
     match parsed.tag.as_str() {
         "#text" => {
             NodeKind::Text {
@@ -646,6 +655,48 @@ fn determine_node_kind(parsed: &ParsedNode) -> NodeKind {
             NodeKind::DataBound { binding, format }
         }
         "data-bar" => {
+            let binding = parsed.attributes.get("data-binding")
+                .or_else(|| parsed.attributes.get("binding"))
+                .cloned()
+                .unwrap_or_default();
+            let max: f32 = parsed.attributes.get("max")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100.0);
+            NodeKind::DataBar { binding, max, value: 0.0 }
+        }
+        "data-bar-stack" => {
+            // Collect segments from children (<data-bar-segment> void elements).
+            let mut segments = Vec::new();
+            for child in &parsed.children {
+                if child.tag == "data-bar-segment" {
+                    let binding = child.attributes.get("data-binding")
+                        .or_else(|| child.attributes.get("binding"))
+                        .cloned()
+                        .unwrap_or_default();
+                    let max: f32 = child.attributes.get("max")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(100.0);
+                    // Parse color from inline style `color: ...`
+                    let color = child.inline_style.split(';')
+                        .find_map(|decl| {
+                            let decl = decl.trim();
+                            if let Some((prop, val)) = decl.split_once(':') {
+                                if prop.trim() == "color" {
+                                    let resolved = resolve_var_pub(val.trim(), variables);
+                                    return parse_color(&resolved).map(|c| c.to_array());
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or([1.0, 1.0, 1.0, 0.8]);
+                    segments.push(BarSegment { binding, max, value: 0.0, color });
+                }
+            }
+            NodeKind::DataBarStack { segments }
+        }
+        "data-bar-segment" => {
+            // Segments are consumed by their parent data-bar-stack.
+            // If encountered standalone, treat as a single-segment bar.
             let binding = parsed.attributes.get("data-binding")
                 .or_else(|| parsed.attributes.get("binding"))
                 .cloned()
