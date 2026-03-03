@@ -85,6 +85,8 @@ impl JsRuntime {
         });
 
         let mut context = Context::default();
+        // NOTE: activate() must be called before tick/execute/restyle
+        //       when multiple JsRuntime instances share the same thread.
 
         // Register all native functions
         register_console(&mut context);
@@ -135,8 +137,19 @@ impl JsRuntime {
         }
     }
 
+    /// Activate this runtime's state in the thread-local so that native
+    /// callbacks (`with_state`) resolve to the correct instance.  Must be
+    /// called before tick / execute / restyle when multiple JsRuntime
+    /// instances share the same thread.
+    pub fn activate(&self) {
+        RUNTIME_STATE.with(|cell| {
+            *cell.borrow_mut() = Some(self.state.clone());
+        });
+    }
+
     /// Execute script source code.
     pub fn execute(&mut self, source: &str, name: &str) {
+        self.activate();
         log::warn!("[CX][JS] Executing script '{}' ({} bytes)", name, source.len());
         let result = self.context.eval(Source::from_bytes(source.as_bytes()));
         match result {
@@ -158,6 +171,7 @@ impl JsRuntime {
 
     /// Execute a script file from disk.
     pub fn execute_file(&mut self, path: &Path) {
+        self.activate();
         log::warn!("[CX][JS] Loading script file: {}", path.display());
         match std::fs::read_to_string(path) {
             Ok(source) => {
@@ -173,6 +187,7 @@ impl JsRuntime {
     /// Run one frame tick: execute all pending requestAnimationFrame callbacks.
     /// Returns true if any canvas was modified (needs GPU texture re-upload).
     pub fn tick(&mut self, dt: f32) -> bool {
+        self.activate();
         // Set the current timestamp for performance.now()
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -197,6 +212,13 @@ impl JsRuntime {
         for canvas in state.canvas_manager.buffers.values_mut() {
             canvas.dirty = false;
         }
+    }
+
+    /// Collect stale gradients — call at the start of each animation frame
+    /// so that per-frame `createRadialGradient` / `createLinearGradient`
+    /// calls don't leak memory.
+    pub fn gc_gradients(&mut self) {
+        self.state.borrow_mut().canvas_manager.gc_gradients();
     }
 
     /// Get all dirty canvas buffers for GPU texture upload.
@@ -238,6 +260,7 @@ impl JsRuntime {
     /// pipeline (tag defaults → parent inherit → compound selector matching
     /// → inline styles).  Call after JS has finished mutating the DOM.
     pub fn restyle(&self) {
+        self.activate();
         let mut state = self.state.borrow_mut();
         let rules = state.css_rules.clone();
         let vars = state.css_variables.clone();

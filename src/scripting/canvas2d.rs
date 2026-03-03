@@ -552,6 +552,15 @@ impl CanvasManager {
         id
     }
 
+    /// Clear all gradient definitions and reset the ID counter.
+    /// Call once per animation frame before new gradients are created
+    /// to prevent unbounded growth when wallpapers re-create gradients
+    /// every frame (e.g. `createRadialGradient()` in a rAF loop).
+    pub fn gc_gradients(&mut self) {
+        self.gradients.clear();
+        self.next_gradient_id = 1;
+    }
+
     /// Add a color stop to an existing gradient.
     pub fn add_gradient_stop(&mut self, gradient_id: GradientId, offset: f32, color: tiny_skia::Color) {
         if let Some(grad) = self.gradients.get_mut(&gradient_id) {
