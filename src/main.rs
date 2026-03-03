@@ -622,6 +622,11 @@ impl App {
         let (instances, clear_color) = scene.tick(vw, vh, dt, &mut renderer.font_system);
         let mut instances = instances.to_vec();
 
+        // Upload gradient textures produced by the paint pass.
+        for grad in &scene.cached_gradient_textures {
+            renderer.upload_canvas_texture(&ctx.device, &ctx.queue, grad.slot, grad.width, grad.height, &grad.rgba);
+        }
+
         // Patch canvas instances with their actual GPU texture slot.
         for inst in &mut instances {
             if inst.texture_index == -1 && (inst.flags & canvasx_runtime::gpu::vertex::UiInstance::FLAG_HAS_TEXTURE) != 0 {

@@ -520,10 +520,14 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
 
         // --- Background ---
         "background-color" | "background" => {
-            if let Some(color) = parse_color(value) {
+            // Try linear-gradient() first
+            if let Some(grad) = parse_linear_gradient(value) {
+                style.background = grad;
+            } else if let Some(rad) = parse_radial_gradient(value) {
+                style.background = rad;
+            } else if let Some(color) = parse_color(value) {
                 style.background = Background::Solid(color);
             }
-            // TODO: parse linear-gradient(), url()
         }
 
         // --- Border ---
@@ -644,6 +648,16 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
                 style.opacity = v.clamp(0.0, 1.0);
             }
         }
+        "backdrop-filter" => {
+            if let Some(blur_px) = parse_backdrop_blur(value) {
+                style.backdrop_blur = blur_px.max(0.0);
+            }
+        }
+        "transform" => {
+            if let Some(scale) = parse_transform_scale(value) {
+                style.transform_scale = scale.max(0.01);
+            }
+        }
         "z-index" => {
             if let Ok(v) = value.parse::<i32>() {
                 style.z_index = v;
@@ -654,8 +668,9 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
         "box-shadow" => {
             if value == "none" {
                 style.box_shadow.clear();
+            } else if let Some(shadow) = parse_box_shadow(value) {
+                style.box_shadow = vec![shadow];
             }
-            // TODO: parse box-shadow shorthand
         }
 
         // --- Transition ---
@@ -886,6 +901,212 @@ fn parse_px(value: &str) -> Option<f32> {
     } else {
         value.parse::<f32>().ok()
     }
+}
+
+/// Parse `backdrop-filter` blur amount from values like `blur(8px)` or
+/// `blur(calc(var(--panel-blur) * 1px))` (after var() resolution).
+fn parse_backdrop_blur(value: &str) -> Option<f32> {
+    let v = value.trim();
+    let start = v.find("blur(")?;
+    let inner = &v[start + 5..];
+    let end = inner.find(')')?;
+    parse_px(inner[..end].trim())
+}
+
+/// Parse transform scale from values like `scale(1.2)`.
+fn parse_transform_scale(value: &str) -> Option<f32> {
+    let v = value.trim();
+    let start = v.find("scale(")?;
+    let inner = &v[start + 6..];
+    let end = inner.find(')')?;
+    inner[..end].trim().parse::<f32>().ok()
+}
+
+/// Split a string on commas, but respect nested parentheses.
+fn split_comma_aware(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+    for ch in s.chars() {
+        if ch == '(' { depth += 1; current.push(ch); }
+        else if ch == ')' { depth -= 1; current.push(ch); }
+        else if ch == ',' && depth == 0 {
+            tokens.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    let t = current.trim().to_string();
+    if !t.is_empty() { tokens.push(t); }
+    tokens
+}
+
+/// Parse a CSS `linear-gradient(angle, stop1, stop2, ...)` value.
+fn parse_linear_gradient(value: &str) -> Option<Background> {
+    let inner = value.strip_prefix("linear-gradient(")
+        .and_then(|s| s.strip_suffix(')'))?;
+    let parts = split_comma_aware(inner);
+    if parts.is_empty() { return None; }
+
+    let mut idx = 0;
+    let mut angle_deg: f32 = 180.0; // default: top-to-bottom
+
+    // Try to parse the first part as an angle or direction
+    let first = parts[0].trim();
+    if first.ends_with("deg") {
+        if let Ok(a) = first.trim_end_matches("deg").trim().parse::<f32>() {
+            angle_deg = a;
+            idx = 1;
+        }
+    } else if first.starts_with("to ") {
+        angle_deg = match first {
+            "to top" => 0.0,
+            "to right" => 90.0,
+            "to bottom" => 180.0,
+            "to left" => 270.0,
+            "to top right" | "to right top" => 45.0,
+            "to bottom right" | "to right bottom" => 135.0,
+            "to bottom left" | "to left bottom" => 225.0,
+            "to top left" | "to left top" => 315.0,
+            _ => 180.0,
+        };
+        idx = 1;
+    }
+
+    let stop_parts: Vec<&str> = parts[idx..].iter().map(|s| s.as_str()).collect();
+    if stop_parts.is_empty() { return None; }
+
+    let mut stops = Vec::new();
+    let n = stop_parts.len();
+    for (i, part) in stop_parts.iter().enumerate() {
+        let part = part.trim();
+        // A stop can be "color position%" or just "color"
+        // Try to find a percentage or px at the end
+        let (color_str, position) = if let Some(pct_idx) = part.rfind('%') {
+            // Find the start of the percentage number
+            let before = &part[..pct_idx];
+            if let Some(space_idx) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.' && c != '-') {
+                let num_str = &part[space_idx+1..pct_idx];
+                let pos = num_str.parse::<f32>().unwrap_or(i as f32 / (n - 1).max(1) as f32 * 100.0) / 100.0;
+                (&part[..=space_idx], Some(pos))
+            } else {
+                (part, None)
+            }
+        } else {
+            // Check for px position at end
+            let words: Vec<&str> = part.rsplitn(2, char::is_whitespace).collect();
+            if words.len() == 2 {
+                if let Some(px) = parse_px(words[0]) {
+                    // px positions need parent width context — approximate as percentage
+                    (words[1], Some(px / 100.0)) // rough approximation
+                } else {
+                    (part, None)
+                }
+            } else {
+                (part, None)
+            }
+        };
+
+        let position = position.unwrap_or_else(|| {
+            if n <= 1 { 0.0 } else { i as f32 / (n - 1) as f32 }
+        });
+
+        if let Some(color) = parse_color(color_str.trim()) {
+            stops.push(GradientStop { color, position });
+        }
+    }
+
+    if stops.is_empty() { return None; }
+
+    Some(Background::LinearGradient { angle_deg, stops })
+}
+
+/// Parse a CSS `radial-gradient(stop1, stop2, ...)` value.
+fn parse_radial_gradient(value: &str) -> Option<Background> {
+    let inner = value.strip_prefix("radial-gradient(")
+        .and_then(|s| s.strip_suffix(')'))?;
+    let parts = split_comma_aware(inner);
+    if parts.is_empty() { return None; }
+
+    let mut stops = Vec::new();
+    let n = parts.len();
+    for (i, part) in parts.iter().enumerate() {
+        let part = part.trim();
+        // Skip shape/extent keywords at the front (e.g. "circle at center")
+        if i == 0 && (part.starts_with("circle") || part.starts_with("ellipse") || part.starts_with("closest") || part.starts_with("farthest")) {
+            continue;
+        }
+
+        let (color_str, position) = if let Some(pct_idx) = part.rfind('%') {
+            let before = &part[..pct_idx];
+            if let Some(space_idx) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.' && c != '-') {
+                let num_str = &part[space_idx+1..pct_idx];
+                let pos = num_str.parse::<f32>().unwrap_or(i as f32 / (n - 1).max(1) as f32 * 100.0) / 100.0;
+                (&part[..=space_idx], Some(pos))
+            } else {
+                (part, None)
+            }
+        } else {
+            (part, None)
+        };
+
+        let position = position.unwrap_or_else(|| {
+            if n <= 1 { 0.0 } else { i as f32 / (n - 1) as f32 }
+        });
+
+        if let Some(color) = parse_color(color_str.trim()) {
+            stops.push(GradientStop { color, position });
+        }
+    }
+
+    if stops.is_empty() { return None; }
+
+    Some(Background::RadialGradient { stops })
+}
+
+/// Parse a single `box-shadow` value: `offset-x offset-y blur-radius spread-radius color`
+fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
+    let value = value.trim();
+    if value == "none" || value.is_empty() { return None; }
+
+    // Extract color portion: find rgba(...) or rgb(...) or #hex or named color
+    let (color, remainder) = if let Some(rgba_start) = value.find("rgba(") {
+        let end = value[rgba_start..].find(')').map(|e| rgba_start + e + 1)?;
+        let c = parse_color(&value[rgba_start..end])?;
+        let rest = format!("{} {}", &value[..rgba_start], &value[end..]);
+        (c, rest)
+    } else if let Some(rgb_start) = value.find("rgb(") {
+        let end = value[rgb_start..].find(')').map(|e| rgb_start + e + 1)?;
+        let c = parse_color(&value[rgb_start..end])?;
+        let rest = format!("{} {}", &value[..rgb_start], &value[end..]);
+        (c, rest)
+    } else {
+        // Try the last token as a hex or named color
+        let tokens: Vec<&str> = value.split_whitespace().collect();
+        if tokens.len() >= 3 {
+            if let Some(c) = tokens.last().and_then(|t| parse_color(t)) {
+                let rest = tokens[..tokens.len()-1].join(" ");
+                (c, rest)
+            } else {
+                (Color::new(0.0, 0.0, 0.0, 0.5), value.to_string())
+            }
+        } else {
+            return None;
+        }
+    };
+
+    // Parse numeric values from remainder
+    let nums: Vec<f32> = remainder.split_whitespace()
+        .filter_map(|t| parse_px(t))
+        .collect();
+
+    let offset_x = nums.first().copied().unwrap_or(0.0);
+    let offset_y = nums.get(1).copied().unwrap_or(0.0);
+    let blur_radius = nums.get(2).copied().unwrap_or(0.0);
+    let spread_radius = nums.get(3).copied().unwrap_or(0.0);
+
+    Some(BoxShadow { offset_x, offset_y, blur_radius, spread_radius, color, inset: false })
 }
 
 /// Parse a CSS color value.

@@ -106,6 +106,41 @@ fn layout_node_recursive(
     for &child_id in &children {
         layout_node_recursive(doc, child_id, constraints, child_clip);
     }
+
+    // Apply simple transform scale() (top-left origin) to this subtree.
+    if (style.transform_scale - 1.0).abs() > f32::EPSILON {
+        apply_scale_to_subtree(doc, node_id, container_rect.x, container_rect.y, style.transform_scale);
+    }
+}
+
+fn apply_scale_to_subtree(doc: &mut CxrdDocument, root_id: NodeId, origin_x: f32, origin_y: f32, scale: f32) {
+    let mut stack = vec![root_id];
+    while let Some(node_id) = stack.pop() {
+        if let Some(node) = doc.nodes.get_mut(node_id as usize) {
+            let rect = &mut node.layout.rect;
+            rect.x = origin_x + (rect.x - origin_x) * scale;
+            rect.y = origin_y + (rect.y - origin_y) * scale;
+            rect.width *= scale;
+            rect.height *= scale;
+
+            let content = &mut node.layout.content_rect;
+            content.x = origin_x + (content.x - origin_x) * scale;
+            content.y = origin_y + (content.y - origin_y) * scale;
+            content.width *= scale;
+            content.height *= scale;
+
+            if let Some(clip) = &mut node.layout.clip {
+                clip.x = origin_x + (clip.x - origin_x) * scale;
+                clip.y = origin_y + (clip.y - origin_y) * scale;
+                clip.width *= scale;
+                clip.height *= scale;
+            }
+
+            for &child in &node.children {
+                stack.push(child);
+            }
+        }
+    }
 }
 
 /// Layout children using CSS Grid.

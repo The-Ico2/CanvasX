@@ -289,6 +289,8 @@ pub struct ComputedStyle {
     pub border_width: EdgeInsets,
     pub border_radius: CornerRadii,
     pub box_shadow: Vec<BoxShadow>,
+    pub backdrop_blur: f32,
+    pub transform_scale: f32,
     pub opacity: f32,
 
     // --- Grid ---
@@ -374,6 +376,8 @@ impl Default for ComputedStyle {
             border_width: EdgeInsets::default(),
             border_radius: CornerRadii::default(),
             box_shadow: Vec::new(),
+            backdrop_blur: 0.0,
+            transform_scale: 1.0,
             opacity: 1.0,
             color: Color::WHITE,
             font_family: String::new(),

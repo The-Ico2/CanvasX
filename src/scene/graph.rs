@@ -9,7 +9,7 @@ use crate::cxrd::document::CxrdDocument;
 use crate::cxrd::value::Color;
 use crate::gpu::vertex::UiInstance;
 use crate::layout::engine::compute_layout;
-use crate::scene::paint::paint_document;
+use crate::scene::paint::{paint_document, GradientTexture};
 use crate::scene::text::TextPainter;
 use crate::animate::timeline::AnimationTimeline;
 
@@ -32,6 +32,9 @@ pub struct SceneGraph {
 
     /// Cached paint output.
     cached_instances: Vec<UiInstance>,
+
+    /// Gradient textures from the last paint pass (to be uploaded each frame).
+    pub cached_gradient_textures: Vec<GradientTexture>,
 }
 
 impl SceneGraph {
@@ -44,6 +47,7 @@ impl SceneGraph {
             timeline: AnimationTimeline::new(),
             layout_dirty: true,
             cached_instances: Vec::new(),
+            cached_gradient_textures: Vec::new(),
         }
     }
 
@@ -52,6 +56,7 @@ impl SceneGraph {
         self.document = doc;
         self.layout_dirty = true;
         self.cached_instances.clear();
+        self.cached_gradient_textures.clear();
         self.timeline = AnimationTimeline::new();
     }
 
@@ -95,7 +100,9 @@ impl SceneGraph {
         self.text_painter.prepare(&self.document, font_system, &self.data_values);
 
         // 4. Paint.
-        self.cached_instances = paint_document(&self.document);
+        let paint_output = paint_document(&self.document);
+        self.cached_instances = paint_output.instances;
+        self.cached_gradient_textures = paint_output.gradient_textures;
 
         (&self.cached_instances, self.document.background)
     }

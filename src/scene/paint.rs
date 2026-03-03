@@ -7,18 +7,39 @@
 use crate::cxrd::document::CxrdDocument;
 use crate::cxrd::node::{NodeId, NodeKind, CxrdNode};
 use crate::cxrd::input::{InputKind, ButtonVariant, CheckboxStyle};
-use crate::cxrd::style::{Display, Background};
+use crate::cxrd::style::{Display, Background, GradientStop};
 use crate::gpu::vertex::UiInstance;
 
+/// A rasterized gradient texture to upload.
+pub struct GradientTexture {
+    /// Unique slot (high range, 20000+)
+    pub slot: u32,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Output from the paint pass.
+pub struct PaintOutput {
+    pub instances: Vec<UiInstance>,
+    pub gradient_textures: Vec<GradientTexture>,
+}
+
+static NEXT_GRADIENT_SLOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20000);
+
 /// Paint the entire document into a list of GPU instances.
-pub fn paint_document(doc: &CxrdDocument) -> Vec<UiInstance> {
+pub fn paint_document(doc: &CxrdDocument) -> PaintOutput {
+    // Reset gradient slot counter each frame to reuse slots
+    NEXT_GRADIENT_SLOT.store(20000, std::sync::atomic::Ordering::Relaxed);
+
     let mut instances = Vec::with_capacity(doc.nodes.len());
-    paint_node(doc, doc.root, &mut instances);
-    instances
+    let mut gradient_textures = Vec::new();
+    paint_node(doc, doc.root, &mut instances, &mut gradient_textures);
+    PaintOutput { instances, gradient_textures }
 }
 
 /// Recursively paint a node and its children.
-fn paint_node(doc: &CxrdDocument, node_id: NodeId, out: &mut Vec<UiInstance>) {
+fn paint_node(doc: &CxrdDocument, node_id: NodeId, out: &mut Vec<UiInstance>, grad_textures: &mut Vec<GradientTexture>) {
     let node = match doc.get_node(node_id) {
         Some(n) => n,
         None => return,
@@ -28,9 +49,118 @@ fn paint_node(doc: &CxrdDocument, node_id: NodeId, out: &mut Vec<UiInstance>) {
         return;
     }
 
+    // Emit box-shadow quads BEHIND the node.
+    if !node.style.box_shadow.is_empty() {
+        let r = &node.layout.rect;
+        let clip = node.layout.clip
+            .map(|c| c.to_array())
+            .unwrap_or([0.0, 0.0, 99999.0, 99999.0]);
+        for shadow in &node.style.box_shadow {
+            if shadow.inset { continue; } // skip inset shadows for now
+            let expand = shadow.blur_radius + shadow.spread_radius;
+            let sx = r.x + shadow.offset_x - expand;
+            let sy = r.y + shadow.offset_y - expand;
+            let sw = r.width + expand * 2.0;
+            let sh = r.height + expand * 2.0;
+            // Use the shadow color with reduced alpha for the blur approximation
+            let c = shadow.color.to_array();
+            let blur_alpha = c[3] * 0.5; // soften
+            out.push(UiInstance {
+                rect: [sx, sy, sw, sh],
+                bg_color: [c[0], c[1], c[2], blur_alpha],
+                border_color: [0.0; 4],
+                border_width: [0.0; 4],
+                border_radius: [
+                    node.style.border_radius.top_left + expand * 0.5,
+                    node.style.border_radius.top_right + expand * 0.5,
+                    node.style.border_radius.bottom_right + expand * 0.5,
+                    node.style.border_radius.bottom_left + expand * 0.5,
+                ],
+                clip_rect: clip,
+                texture_index: -1,
+                opacity: node.style.opacity,
+                flags: UiInstance::FLAG_HAS_BACKGROUND | if node.layout.clip.is_some() { UiInstance::FLAG_HAS_CLIP } else { 0 },
+                _pad: 0,
+            });
+        }
+    }
+
     // Only emit an instance if the node has visible visual properties.
     if should_paint(node) {
-        out.push(node_to_instance(node));
+        // Check for gradient backgrounds — rasterize to texture
+        match &node.style.background {
+            Background::LinearGradient { angle_deg, stops } if !stops.is_empty() => {
+                let r = &node.layout.rect;
+                if r.width > 0.0 && r.height > 0.0 {
+                    let slot = NEXT_GRADIENT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let rgba = rasterize_linear_gradient(*angle_deg, stops, r.width as u32, r.height as u32);
+                    grad_textures.push(GradientTexture {
+                        slot,
+                        width: r.width.ceil() as u32,
+                        height: r.height.ceil() as u32,
+                        rgba,
+                    });
+                    // Emit a textured quad
+                    let clip = node.layout.clip
+                        .map(|c| c.to_array())
+                        .unwrap_or([0.0, 0.0, 99999.0, 99999.0]);
+                    let mut flags = UiInstance::FLAG_HAS_BACKGROUND | UiInstance::FLAG_HAS_TEXTURE;
+                    if node.layout.clip.is_some() { flags |= UiInstance::FLAG_HAS_CLIP; }
+                    let has_border = node.style.border_width.top > 0.0
+                        || node.style.border_width.right > 0.0
+                        || node.style.border_width.bottom > 0.0
+                        || node.style.border_width.left > 0.0;
+                    if has_border { flags |= UiInstance::FLAG_HAS_BORDER; }
+                    out.push(UiInstance {
+                        rect: r.to_array(),
+                        bg_color: [0.0, 0.0, 0.0, 0.0],
+                        border_color: node.style.border_color.to_array(),
+                        border_width: [node.style.border_width.top, node.style.border_width.right,
+                                       node.style.border_width.bottom, node.style.border_width.left],
+                        border_radius: node.style.border_radius.to_array(),
+                        clip_rect: clip,
+                        texture_index: slot as i32,
+                        opacity: node.style.opacity,
+                        flags,
+                        _pad: 0,
+                    });
+                }
+            }
+            Background::RadialGradient { stops } if !stops.is_empty() => {
+                let r = &node.layout.rect;
+                if r.width > 0.0 && r.height > 0.0 {
+                    let slot = NEXT_GRADIENT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let rgba = rasterize_radial_gradient(stops, r.width as u32, r.height as u32);
+                    grad_textures.push(GradientTexture {
+                        slot,
+                        width: r.width.ceil() as u32,
+                        height: r.height.ceil() as u32,
+                        rgba,
+                    });
+                    let clip = node.layout.clip
+                        .map(|c| c.to_array())
+                        .unwrap_or([0.0, 0.0, 99999.0, 99999.0]);
+                    let mut flags = UiInstance::FLAG_HAS_BACKGROUND | UiInstance::FLAG_HAS_TEXTURE;
+                    if node.layout.clip.is_some() { flags |= UiInstance::FLAG_HAS_CLIP; }
+                    out.push(UiInstance {
+                        rect: r.to_array(),
+                        bg_color: [0.0, 0.0, 0.0, 0.0],
+                        border_color: node.style.border_color.to_array(),
+                        border_width: [node.style.border_width.top, node.style.border_width.right,
+                                       node.style.border_width.bottom, node.style.border_width.left],
+                        border_radius: node.style.border_radius.to_array(),
+                        clip_rect: clip,
+                        texture_index: slot as i32,
+                        opacity: node.style.opacity,
+                        flags,
+                        _pad: 0,
+                    });
+                }
+            }
+            _ => {
+                out.push(node_to_instance(node));
+            }
+        }
     }
 
     // For Input nodes, emit extra widget-specific quads.
@@ -68,7 +198,7 @@ fn paint_node(doc: &CxrdDocument, node_id: NodeId, out: &mut Vec<UiInstance>) {
     });
 
     for cid in child_ids {
-        paint_node(doc, cid, out);
+        paint_node(doc, cid, out, grad_textures);
     }
 }
 
@@ -355,7 +485,7 @@ fn node_to_instance(node: &CxrdNode) -> UiInstance {
     let r = &node.layout.rect;
 
     let bg_color = match &s.background {
-        Background::Solid(c) => c.to_array(),
+        Background::Solid(c) => apply_backdrop_fallback(c.to_array(), s.backdrop_blur),
         Background::LinearGradient { stops, .. } => {
             // For now, use the first stop color. Full gradient support
             // will require a separate gradient shader pass.
@@ -400,4 +530,123 @@ fn node_to_instance(node: &CxrdNode) -> UiInstance {
         flags,
         _pad: 0,
     }
+}
+
+/// Approximate CSS `backdrop-filter: blur(...)` for translucent panels.
+///
+/// Native CanvasX doesn't blur the framebuffer yet, so we emulate the
+/// readability effect by slightly increasing alpha and lifting luminance.
+fn apply_backdrop_fallback(mut color: [f32; 4], backdrop_blur: f32) -> [f32; 4] {
+    if backdrop_blur <= 0.0 || color[3] <= 0.0 || color[3] >= 1.0 {
+        return color;
+    }
+
+    let strength = (backdrop_blur / 24.0).clamp(0.0, 1.0);
+    color[3] = (color[3] + 0.18 * strength).min(1.0);
+
+    let lift = 0.10 * strength;
+    color[0] = (color[0] + (1.0 - color[0]) * lift).clamp(0.0, 1.0);
+    color[1] = (color[1] + (1.0 - color[1]) * lift).clamp(0.0, 1.0);
+    color[2] = (color[2] + (1.0 - color[2]) * lift).clamp(0.0, 1.0);
+
+    color
+}
+// ---------------------------------------------------------------------------
+// Gradient rasterization
+// ---------------------------------------------------------------------------
+
+/// Interpolate between gradient stops at position t (0..1).
+fn sample_gradient(stops: &[GradientStop], t: f32) -> [u8; 4] {
+    if stops.is_empty() { return [0, 0, 0, 0]; }
+    if stops.len() == 1 {
+        let c = stops[0].color.to_array();
+        return [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8, (c[3] * 255.0) as u8];
+    }
+
+    let t = t.clamp(0.0, 1.0);
+
+    // Find the two stops to interpolate between
+    if t <= stops[0].position {
+        let c = stops[0].color.to_array();
+        return [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8, (c[3] * 255.0) as u8];
+    }
+    if t >= stops[stops.len() - 1].position {
+        let c = stops[stops.len() - 1].color.to_array();
+        return [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8, (c[3] * 255.0) as u8];
+    }
+
+    for i in 0..stops.len() - 1 {
+        if t >= stops[i].position && t <= stops[i + 1].position {
+            let range = stops[i + 1].position - stops[i].position;
+            let f = if range > 0.0 { (t - stops[i].position) / range } else { 0.0 };
+            let a = stops[i].color.to_array();
+            let b = stops[i + 1].color.to_array();
+            // Premultiplied alpha interpolation
+            let r = (a[0] * a[3] * (1.0 - f) + b[0] * b[3] * f) * 255.0;
+            let g = (a[1] * a[3] * (1.0 - f) + b[1] * b[3] * f) * 255.0;
+            let blue = (a[2] * a[3] * (1.0 - f) + b[2] * b[3] * f) * 255.0;
+            let alpha = (a[3] * (1.0 - f) + b[3] * f) * 255.0;
+            return [r as u8, g as u8, blue as u8, alpha as u8];
+        }
+    }
+
+    [0, 0, 0, 0]
+}
+
+/// Rasterize a linear gradient into RGBA pixels.
+fn rasterize_linear_gradient(angle_deg: f32, stops: &[GradientStop], w: u32, h: u32) -> Vec<u8> {
+    // Clamp dimensions to avoid huge allocations
+    let w = w.min(2048).max(1);
+    let h = h.min(2048).max(1);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+
+    let angle_rad = angle_deg.to_radians();
+    // CSS gradient angle: 0deg = to top, 90deg = to right, 180deg = to bottom
+    let dx = angle_rad.sin();
+    let dy = -angle_rad.cos();
+
+    for y in 0..h {
+        for x in 0..w {
+            // Normalize to -0.5..0.5 range
+            let nx = x as f32 / w as f32 - 0.5;
+            let ny = y as f32 / h as f32 - 0.5;
+            // Project onto gradient direction
+            let t = (nx * dx + ny * dy) + 0.5;
+            let pixel = sample_gradient(stops, t);
+            let idx = ((y * w + x) * 4) as usize;
+            rgba[idx] = pixel[0];
+            rgba[idx + 1] = pixel[1];
+            rgba[idx + 2] = pixel[2];
+            rgba[idx + 3] = pixel[3];
+        }
+    }
+
+    rgba
+}
+
+/// Rasterize a radial gradient into RGBA pixels.
+fn rasterize_radial_gradient(stops: &[GradientStop], w: u32, h: u32) -> Vec<u8> {
+    let w = w.min(2048).max(1);
+    let h = h.min(2048).max(1);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+
+    let cx = w as f32 / 2.0;
+    let cy = h as f32 / 2.0;
+    let max_r = (cx * cx + cy * cy).sqrt();
+
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let t = (dx * dx + dy * dy).sqrt() / max_r;
+            let pixel = sample_gradient(stops, t);
+            let idx = ((y * w + x) * 4) as usize;
+            rgba[idx] = pixel[0];
+            rgba[idx + 1] = pixel[1];
+            rgba[idx + 2] = pixel[2];
+            rgba[idx + 3] = pixel[3];
+        }
+    }
+
+    rgba
 }
