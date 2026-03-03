@@ -1364,6 +1364,53 @@ fn set_inner_html(st: &mut SharedState, node_id: NodeId, html: &str) {
     st.layout_dirty = true;
 }
 
+/// Decode a base64-encoded string to raw bytes.
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut lut = [255u8; 256];
+    for (i, &c) in TABLE.iter().enumerate() {
+        lut[c as usize] = i as u8;
+    }
+    let input: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for chunk in input.chunks(4) {
+        let mut buf = [0u8; 4];
+        let mut valid = 0usize;
+        for (i, &b) in chunk.iter().enumerate() {
+            if b == b'=' { break; }
+            if lut[b as usize] == 255 { return None; }
+            buf[i] = lut[b as usize];
+            valid += 1;
+        }
+        if valid >= 2 { out.push((buf[0] << 2) | (buf[1] >> 4)); }
+        if valid >= 3 { out.push((buf[1] << 4) | (buf[2] >> 2)); }
+        if valid >= 4 { out.push((buf[2] << 6) | buf[3]); }
+    }
+    Some(out)
+}
+
+/// Decode a `data:image/...;base64,...` URL into (width, height, premultiplied RGBA pixels).
+fn decode_data_url_image(src: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let rest = src.strip_prefix("data:")?;
+    let (_header, b64) = rest.split_once(',')?;
+    let raw = decode_base64(b64)?;
+    let img = image::load_from_memory(&raw).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 { return None; }
+    let mut pixels = rgba.into_raw();
+    // Premultiply alpha for tiny_skia / GPU compatibility
+    for chunk in pixels.chunks_exact_mut(4) {
+        let a = chunk[3] as u32;
+        if a < 255 {
+            chunk[0] = ((chunk[0] as u32 * a + 128) / 255) as u8;
+            chunk[1] = ((chunk[1] as u32 * a + 128) / 255) as u8;
+            chunk[2] = ((chunk[2] as u32 * a + 128) / 255) as u8;
+        }
+    }
+    Some((w, h, pixels))
+}
+
 /// Parse an HTML fragment and add the resulting nodes as children of parent_id.
 fn add_html_children(st: &mut SharedState, parent_id: NodeId, html: &str) {
     // Use a simplified inline HTML parser for fragments
@@ -1444,13 +1491,25 @@ fn add_html_children(st: &mut SharedState, parent_id: NodeId, html: &str) {
             if self_closing { pos += 1; }
             if pos < bytes.len() && bytes[pos] == b'>' { pos += 1; }
 
+            // Pre-decode <img> data URLs before attributes are moved into the node
+            let img_data = if tag == "img" {
+                attributes.get("src").and_then(|s| decode_data_url_image(s))
+            } else {
+                None
+            };
+
             // Create node
             let mut node = crate::cxrd::node::CxrdNode::container(0);
             node.tag = Some(tag.clone());
             node.html_id = html_id;
             node.classes = classes;
             node.attributes = attributes;
-            node.kind = NodeKind::Container;
+            // <img> with decoded data URL → Canvas node for the existing texture pipeline
+            if let Some((iw, ih, _)) = &img_data {
+                node.kind = NodeKind::Canvas { width: *iw, height: *ih };
+            } else {
+                node.kind = NodeKind::Container;
+            }
 
             // Apply inline styles
             if !inline_style.is_empty() {
@@ -1487,6 +1546,21 @@ fn add_html_children(st: &mut SharedState, parent_id: NodeId, html: &str) {
             // For canvas elements, create a canvas buffer (same as __cx_createElement)
             if tag == "canvas" {
                 let cid = st.canvas_manager.create_canvas(300, 150);
+                st.node_canvas_map.insert(child_id, cid);
+            }
+
+            // For <img> with decoded data URL, create a canvas with the image pixels
+            if let Some((img_w, img_h, pixels)) = img_data {
+                let cid = st.canvas_manager.create_canvas(img_w, img_h);
+                if let Some(canvas) = st.canvas_manager.buffers.get_mut(&cid) {
+                    if let Some(pm) = tiny_skia::Pixmap::from_vec(
+                        pixels,
+                        tiny_skia::IntSize::from_wh(img_w, img_h).unwrap(),
+                    ) {
+                        canvas.pixmap = pm;
+                    }
+                    canvas.dirty = true;
+                }
                 st.node_canvas_map.insert(child_id, cid);
             }
 
