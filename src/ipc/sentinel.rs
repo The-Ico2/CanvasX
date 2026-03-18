@@ -54,6 +54,9 @@ pub struct SentinelBridge {
     /// Whether polling is active.
     polling_active: Arc<AtomicBool>,
 
+    /// Shutdown flag for the background thread.
+    shutdown: Arc<AtomicBool>,
+
     /// Background thread handle.
     _thread: Option<thread::JoinHandle<()>>,
 }
@@ -101,6 +104,7 @@ impl SentinelBridge {
         let tracking_demands = Arc::new(Mutex::new(config.tracking_demands.clone()));
         let poll_interval_ms = Arc::new(AtomicU64::new(config.poll_interval_ms));
         let polling_active = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let thread_state = BridgeThreadState {
             pipe_name: config.pipe_name.clone(),
@@ -111,6 +115,7 @@ impl SentinelBridge {
             tracking_demands: tracking_demands.clone(),
             poll_interval_ms: poll_interval_ms.clone(),
             polling_active: polling_active.clone(),
+            shutdown: shutdown.clone(),
             send_heartbeats: config.send_heartbeats,
         };
 
@@ -127,6 +132,7 @@ impl SentinelBridge {
             tracking_demands,
             poll_interval_ms,
             polling_active,
+            shutdown,
             _thread: Some(handle),
         }
     }
@@ -259,6 +265,7 @@ struct BridgeThreadState {
     tracking_demands: Arc<Mutex<Vec<String>>>,
     poll_interval_ms: Arc<AtomicU64>,
     polling_active: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     send_heartbeats: bool,
 }
 
@@ -266,9 +273,9 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
     log::info!("Sentinel bridge: starting (pipe: {})", state.pipe_name);
 
     let mut heartbeat_timer = Instant::now();
-    let mut demands_sent = false;
+    let mut last_demands_sent: Option<Vec<String>> = None;
 
-    loop {
+    while !state.shutdown.load(Ordering::Relaxed) {
         let interval = state.poll_interval_ms.load(Ordering::Relaxed);
 
         if !state.polling_active.load(Ordering::Relaxed) {
@@ -276,18 +283,16 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
             continue;
         }
 
-        // Send tracking demands if changed.
-        if !demands_sent {
-            let sections = state.tracking_demands.lock().unwrap().clone();
-            if !sections.is_empty() {
-                let request = IpcRequest::with_args(
-                    "backend",
-                    "set_tracking_demands",
-                    json!({ "sections": sections }),
-                );
-                if send_ipc_request_to(&state.pipe_name, request).is_ok() {
-                    demands_sent = true;
-                }
+        // Send tracking demands whenever they change (including clear []).
+        let sections = state.tracking_demands.lock().unwrap().clone();
+        if last_demands_sent.as_ref() != Some(&sections) {
+            let request = IpcRequest::with_args(
+                "backend",
+                "set_tracking_demands",
+                json!({ "sections": sections }),
+            );
+            if send_ipc_request_to(&state.pipe_name, request).is_ok() {
+                last_demands_sent = Some(state.tracking_demands.lock().unwrap().clone());
             }
         }
 
@@ -327,7 +332,8 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
                     log::warn!("Sentinel bridge: connection lost ({})", e);
                 }
                 state.connected.store(false, Ordering::Relaxed);
-                demands_sent = false; // Re-send demands on reconnect.
+                // Re-send demands on reconnect.
+                last_demands_sent = None;
                 thread::sleep(Duration::from_millis(1000));
                 continue;
             }
@@ -343,6 +349,26 @@ fn sentinel_poll_loop(state: BridgeThreadState) {
         }
 
         thread::sleep(Duration::from_millis(interval));
+    }
+
+    log::info!("Sentinel bridge: stopped");
+}
+
+impl Drop for SentinelBridge {
+    fn drop(&mut self) {
+        // Stop polling loop and request background thread exit.
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.polling_active.store(false, Ordering::Relaxed);
+
+        // Best-effort clear of explicit tracking demands so sentinel-core can idle.
+        let _ = send_ipc_request_to(
+            &self.pipe_name,
+            IpcRequest::with_args("backend", "set_tracking_demands", json!({ "sections": Vec::<String>::new() })),
+        );
+
+        if let Some(handle) = self._thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 

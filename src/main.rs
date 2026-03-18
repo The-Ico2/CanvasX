@@ -520,6 +520,7 @@ impl App {
     fn dispatch_input(&mut self, raw: RawInputEvent) {
         let Some(ref mut scene) = self.scene else { return };
         let ui_events = self.input_handler.process_event(&mut scene.document, raw);
+        let had_events = !ui_events.is_empty();
 
         for event in ui_events {
             match event {
@@ -538,6 +539,13 @@ impl App {
                     log::debug!("UI event: {:?}", other);
                 }
             }
+        }
+
+        // Input processing may mutate node kinds/styles (checkbox toggle,
+        // dropdown open state, text value changes). Ensure those changes are
+        // reflected by forcing a fresh layout/paint pass.
+        if had_events {
+            scene.invalidate_layout();
         }
 
         // Apply updated cursor icon.

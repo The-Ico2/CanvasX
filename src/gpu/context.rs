@@ -189,13 +189,9 @@ impl GpuContext {
             .copied()
             .unwrap_or(caps.formats[0]);
 
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-            wgpu::PresentMode::Immediate
-        } else {
-            wgpu::PresentMode::Fifo
-        };
+        // Use Fifo for deterministic VSync pacing across monitors.
+        // Mailbox/Immediate can produce inconsistent uncapped behaviour per output.
+        let present_mode = wgpu::PresentMode::Fifo;
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -204,7 +200,7 @@ impl GpuContext {
             height,
             present_mode,
             alpha_mode: caps.alpha_modes[0],
-            desired_maximum_frame_latency: 1,
+            desired_maximum_frame_latency: 3,
             view_formats: vec![],
         };
         surface.configure(&device, &surface_config);
