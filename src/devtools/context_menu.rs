@@ -1,0 +1,283 @@
+// canvasx-runtime/src/devtools/context_menu.rs
+//
+// In-window right-click context menu rendered as a GPU overlay.
+// Provides access to DevTools, Reload, and Exit without a system tray.
+
+use crate::cxrd::value::Color;
+use crate::gpu::vertex::UiInstance;
+use super::DevToolsTextEntry;
+
+// Visual constants.
+const MENU_WIDTH: f32 = 180.0;
+const ITEM_HEIGHT: f32 = 28.0;
+const SEPARATOR_HEIGHT: f32 = 9.0;
+const MENU_PADDING: f32 = 4.0;
+const MENU_RADIUS: f32 = 6.0;
+
+const BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 0.96 };
+const HOVER_BG: Color = Color { r: 0.20, g: 0.20, b: 0.28, a: 1.0 };
+const BORDER: Color = Color { r: 0.25, g: 0.25, b: 0.30, a: 1.0 };
+const SEPARATOR_COLOR: Color = Color { r: 0.22, g: 0.22, b: 0.28, a: 1.0 };
+const TEXT_COLOR: Color = Color { r: 0.85, g: 0.85, b: 0.88, a: 1.0 };
+const TEXT_DISABLED: Color = Color { r: 0.45, g: 0.45, b: 0.48, a: 1.0 };
+const ACCENT: Color = Color { r: 0.39, g: 0.40, b: 0.95, a: 1.0 };
+
+/// An item in the context menu.
+#[derive(Debug, Clone)]
+pub enum ContextMenuEntry {
+    Item {
+        label: String,
+        action: ContextAction,
+        enabled: bool,
+    },
+    Separator,
+}
+
+/// Actions that can be triggered from the context menu.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContextAction {
+    ToggleDevTools,
+    Reload,
+    Exit,
+}
+
+/// The in-window context menu state.
+pub struct ContextMenu {
+    /// Whether the menu is visible.
+    pub open: bool,
+    /// Top-left position (in logical pixels).
+    pub x: f32,
+    pub y: f32,
+    /// Index of the currently hovered item (None if no hover).
+    pub hovered: Option<usize>,
+    /// The menu entries.
+    entries: Vec<ContextMenuEntry>,
+}
+
+impl ContextMenu {
+    pub fn new() -> Self {
+        Self {
+            open: false,
+            x: 0.0,
+            y: 0.0,
+            hovered: None,
+            entries: Self::default_entries(),
+        }
+    }
+
+    fn default_entries() -> Vec<ContextMenuEntry> {
+        vec![
+            ContextMenuEntry::Item {
+                label: "DevTools".to_string(),
+                action: ContextAction::ToggleDevTools,
+                enabled: true,
+            },
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::Item {
+                label: "Reload".to_string(),
+                action: ContextAction::Reload,
+                enabled: true,
+            },
+            ContextMenuEntry::Item {
+                label: "Exit".to_string(),
+                action: ContextAction::Exit,
+                enabled: true,
+            },
+        ]
+    }
+
+    /// Show the context menu at the given position.
+    /// Adjusts position if the menu would overflow the viewport.
+    pub fn show(&mut self, x: f32, y: f32, vw: f32, vh: f32) {
+        let menu_h = self.total_height();
+        // Clamp so the menu stays within the viewport.
+        self.x = x.min(vw - MENU_WIDTH - 4.0).max(0.0);
+        self.y = y.min(vh - menu_h - 4.0).max(0.0);
+        self.hovered = None;
+        self.open = true;
+    }
+
+    /// Hide the context menu.
+    pub fn hide(&mut self) {
+        self.open = false;
+        self.hovered = None;
+    }
+
+    /// Update hover state based on mouse position.
+    pub fn update_hover(&mut self, mx: f32, my: f32) {
+        if !self.open {
+            return;
+        }
+        self.hovered = self.hit_test_item(mx, my);
+    }
+
+    /// Check if a point is inside the context menu area.
+    pub fn hit_test(&self, mx: f32, my: f32) -> bool {
+        if !self.open {
+            return false;
+        }
+        let h = self.total_height();
+        mx >= self.x && mx <= self.x + MENU_WIDTH && my >= self.y && my <= self.y + h
+    }
+
+    /// Get the action for a click at the given position, or None.
+    pub fn click(&mut self, mx: f32, my: f32) -> Option<ContextAction> {
+        if !self.open {
+            return None;
+        }
+        if let Some(idx) = self.hit_test_item(mx, my) {
+            if let Some(ContextMenuEntry::Item { action, enabled, .. }) = self.entries.get(idx) {
+                if *enabled {
+                    let action = action.clone();
+                    self.hide();
+                    return Some(action);
+                }
+            }
+        }
+        // Click outside menu → dismiss.
+        self.hide();
+        None
+    }
+
+    /// Compute which item index (if any) is at position (mx, my).
+    fn hit_test_item(&self, mx: f32, my: f32) -> Option<usize> {
+        if mx < self.x || mx > self.x + MENU_WIDTH {
+            return None;
+        }
+        let mut y = self.y + MENU_PADDING;
+        for (i, entry) in self.entries.iter().enumerate() {
+            let h = match entry {
+                ContextMenuEntry::Item { .. } => ITEM_HEIGHT,
+                ContextMenuEntry::Separator => SEPARATOR_HEIGHT,
+            };
+            if my >= y && my < y + h {
+                return match entry {
+                    ContextMenuEntry::Item { enabled, .. } if *enabled => Some(i),
+                    _ => None,
+                };
+            }
+            y += h;
+        }
+        None
+    }
+
+    fn total_height(&self) -> f32 {
+        let content: f32 = self.entries.iter().map(|e| match e {
+            ContextMenuEntry::Item { .. } => ITEM_HEIGHT,
+            ContextMenuEntry::Separator => SEPARATOR_HEIGHT,
+        }).sum();
+        content + MENU_PADDING * 2.0
+    }
+
+    /// Generate GPU instances for the context menu.
+    pub fn paint(&self) -> Vec<UiInstance> {
+        if !self.open {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let menu_h = self.total_height();
+
+        // Background
+        out.push(make_rect(self.x, self.y, MENU_WIDTH, menu_h, BG, Some(BORDER), MENU_RADIUS));
+
+        // Items
+        let mut y = self.y + MENU_PADDING;
+        for (i, entry) in self.entries.iter().enumerate() {
+            match entry {
+                ContextMenuEntry::Item { .. } => {
+                    // Hover highlight
+                    if self.hovered == Some(i) {
+                        out.push(make_rect(
+                            self.x + MENU_PADDING,
+                            y,
+                            MENU_WIDTH - MENU_PADDING * 2.0,
+                            ITEM_HEIGHT,
+                            HOVER_BG,
+                            None,
+                            4.0,
+                        ));
+                    }
+                    y += ITEM_HEIGHT;
+                }
+                ContextMenuEntry::Separator => {
+                    // Separator line
+                    out.push(make_rect(
+                        self.x + 12.0,
+                        y + SEPARATOR_HEIGHT / 2.0 - 0.5,
+                        MENU_WIDTH - 24.0,
+                        1.0,
+                        SEPARATOR_COLOR,
+                        None,
+                        0.0,
+                    ));
+                    y += SEPARATOR_HEIGHT;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Generate text entries for the context menu.
+    pub fn text_entries(&self) -> Vec<DevToolsTextEntry> {
+        if !self.open {
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        let mut y = self.y + MENU_PADDING;
+
+        for (i, entry) in self.entries.iter().enumerate() {
+            match entry {
+                ContextMenuEntry::Item { label, enabled, action } => {
+                    let color = if !enabled {
+                        TEXT_DISABLED
+                    } else if self.hovered == Some(i) {
+                        ACCENT
+                    } else {
+                        TEXT_COLOR
+                    };
+                    entries.push(DevToolsTextEntry {
+                        text: label.clone(),
+                        x: self.x + 14.0,
+                        y: y + 5.0,
+                        width: MENU_WIDTH - 28.0,
+                        font_size: 12.0,
+                        color,
+                        bold: matches!(action, ContextAction::ToggleDevTools) && self.hovered == Some(i),
+                    });
+                    y += ITEM_HEIGHT;
+                }
+                ContextMenuEntry::Separator => {
+                    y += SEPARATOR_HEIGHT;
+                }
+            }
+        }
+
+        entries
+    }
+}
+
+fn make_rect(
+    x: f32, y: f32, w: f32, h: f32,
+    bg: Color,
+    border: Option<Color>,
+    radius: f32,
+) -> UiInstance {
+    let bc = border.unwrap_or(Color::TRANSPARENT);
+    let bw = if border.is_some() { 1.0 } else { 0.0 };
+    let mut flags = 0u32;
+    if bg.a > 0.0 { flags |= UiInstance::FLAG_HAS_BACKGROUND; }
+    if bw > 0.0 { flags |= UiInstance::FLAG_HAS_BORDER; }
+    UiInstance {
+        rect: [x, y, w, h],
+        bg_color: bg.to_array(),
+        border_color: bc.to_array(),
+        border_width: [bw, bw, bw, bw],
+        border_radius: [radius, radius, radius, radius],
+        clip_rect: [0.0, 0.0, 99999.0, 99999.0],
+        texture_index: -1,
+        opacity: 1.0,
+        flags,
+        _pad: 0,
+    }
+}

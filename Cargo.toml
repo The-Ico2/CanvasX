@@ -68,6 +68,7 @@ zip = "8.2.0"
 sha2 = "0.10.9"
 hex = "0.4.3"
 raw-window-handle = "0.6.2"
+tray-icon = "0.21"
 
 [build-dependencies]
 winresource = "0.1.30"

@@ -39,6 +39,8 @@ fn ensure_v8_initialized() {
 
 thread_local! {
     static RUNTIME_STATE: RefCell<Option<StateRef>> = RefCell::new(None);
+    /// Buffer for console messages emitted by JS code (level, message).
+    static CONSOLE_BUFFER: RefCell<Vec<(i32, String)>> = RefCell::new(Vec::new());
 }
 
 fn with_state<F, R>(f: F) -> R
@@ -463,6 +465,37 @@ impl JsRuntime {
         compute_layout(&mut state.document, vw, vh);
         log::debug!("[CX][JS] Restyled document with {} rules", rules.len());
     }
+
+    /// Drain all console messages buffered since the last call.
+    /// Returns a `Vec` of `(level, message)` tuples where level is:
+    /// 0 = debug, 1 = info/log, 2 = warn, 3 = error.
+    pub fn drain_console(&self) -> Vec<(i32, String)> {
+        CONSOLE_BUFFER.with(|buf| std::mem::take(&mut *buf.borrow_mut()))
+    }
+
+    /// Dispatch a DOM event to JS element listeners (with bubbling).
+    /// Calls the JS-side `__cx_dispatchDomEvent(nodeId, type)` function.
+    pub fn dispatch_dom_event(&mut self, node_id: u32, event_type: &str) {
+        self.activate();
+        let code = format!(
+            "if(typeof __cx_dispatchDomEvent==='function')__cx_dispatchDomEvent({},\"{}\");",
+            node_id, event_type
+        );
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let mut hs = hs.init();
+        let ctx = v8::Local::new(&hs, &self.context);
+        let cs = &mut v8::ContextScope::new(&mut hs, ctx);
+        let source = v8::String::new(cs, &code).unwrap();
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = tc.init();
+        if let Some(script) = v8::Script::compile(&tc, source, None) {
+            if script.run(&tc).is_none() {
+                if let Some(exc) = tc.exception() {
+                    log::error!("[CX][JS] Event dispatch error: {}", exc.to_rust_string_lossy(&tc));
+                }
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -555,6 +588,7 @@ fn cx_log(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments,
         3 => log::error!("[JS] {}", msg),
         _ => log::info!("[JS] {}", msg),
     }
+    CONSOLE_BUFFER.with(|buf| buf.borrow_mut().push((level, msg)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2452,4 +2486,25 @@ try {
     window.innerWidth = parseInt(__vp[0]) || 1920;
     window.innerHeight = parseInt(__vp[1]) || 1080;
 } catch(e) {}
+
+// ─── DOM event dispatch (called from Rust) ───
+// Walk from the target element up through ancestors (bubble phase).
+function __cx_dispatchDomEvent(nodeId, eventType) {
+    var nid = nodeId;
+    while (nid >= 0) {
+        var el = __cx_elementCache[nid];
+        if (el && el._eventListeners && el._eventListeners[eventType]) {
+            var fns = el._eventListeners[eventType].slice();
+            var evt = { type: eventType, target: __cx_wrapElement(nodeId), currentTarget: el, stopPropagation: function(){nid=-1;}, preventDefault: function(){} };
+            for (var i = 0; i < fns.length; i++) {
+                try { fns[i](evt); } catch(e) { console.error(eventType + ' handler error:', e); }
+            }
+            if (nid < 0) break; // stopPropagation was called
+        }
+        // Walk up to parent.
+        var parentStr = __cx_getParentNode(nid);
+        nid = (typeof parentStr === 'number') ? parentStr : parseInt(parentStr);
+        if (isNaN(nid)) break;
+    }
+}
 "#;

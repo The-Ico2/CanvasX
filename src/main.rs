@@ -38,6 +38,8 @@ use canvasx_runtime::cxrd::document::{SceneType, CxrdDocument};
 use canvasx_runtime::cxrd::node::NodeId;
 use canvasx_runtime::scripting::JsRuntime;
 use canvasx_runtime::gpu::vertex::UiInstance;
+use canvasx_runtime::tray::{SystemTray, TrayConfig, TrayEvent};
+use canvasx_runtime::devtools::context_menu::ContextAction;
 
 // ---------------------------------------------------------------------------
 // CLI arguments
@@ -54,6 +56,8 @@ struct CliArgs {
     monitor_index: usize,
     /// Target FPS (0 = VSync).
     target_fps: u32,
+    /// Enable system tray icon.
+    enable_tray: bool,
 }
 
 impl CliArgs {
@@ -65,6 +69,7 @@ impl CliArgs {
         let mut css_override: Option<PathBuf> = None;
         let mut monitor_index: usize = 0;
         let mut target_fps: u32 = 0;
+        let mut enable_tray = false;
 
         let mut i = 1;
         while i < args.len() {
@@ -97,6 +102,7 @@ impl CliArgs {
                         target_fps = args[i].parse().unwrap_or(0);
                     }
                 }
+                "--tray" => enable_tray = true,
                 other => {
                     // Positional: treat as source path.
                     if !other.starts_with('-') {
@@ -113,6 +119,7 @@ impl CliArgs {
             css_override,
             monitor_index,
             target_fps,
+            enable_tray,
         }
     }
 }
@@ -145,6 +152,12 @@ struct App {
     fps_timer: Instant,
     /// Current modifier key state (tracked via ModifiersChanged).
     current_modifiers: winit::keyboard::ModifiersState,
+    /// Built-in DevTools (CanvasX badge + developer panel).
+    devtools: canvasx_runtime::devtools::DevTools,
+    /// System tray icon and menu.
+    system_tray: Option<SystemTray>,
+    /// Whether the window is currently visible (for tray hide/show).
+    window_visible: bool,
 }
 
 impl App {
@@ -167,6 +180,9 @@ impl App {
             frame_count: 0,
             fps_timer: Instant::now(),
             current_modifiers: winit::keyboard::ModifiersState::empty(),
+            devtools: canvasx_runtime::devtools::DevTools::new(),
+            system_tray: None,
+            window_visible: true,
         }
     }
 
@@ -357,6 +373,10 @@ impl ApplicationHandler for App {
         self.pending_scripts = scripts;
         self.compiled_css_rules = css_rules;
 
+        // Populate DevTools GPU info from the adapter.
+        let info = gpu_ctx.adapter.get_info();
+        self.devtools.gpu_info = format!("{} ({:?})", info.name, gpu_ctx.backend);
+
         self.window = Some(window.clone());
         self.gpu_ctx = Some(gpu_ctx);
         self.renderer = Some(renderer);
@@ -394,8 +414,32 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Fire DOMContentLoaded so scripts that register via
+        // document.addEventListener('DOMContentLoaded', ...) actually run.
+        js_rt.execute(
+            r#"(function(){
+                if(typeof __cx_globalListeners==='object' && __cx_globalListeners['DOMContentLoaded']){
+                    var fns=__cx_globalListeners['DOMContentLoaded'].slice();
+                    for(var i=0;i<fns.length;i++){try{fns[i]({type:'DOMContentLoaded'});}catch(e){console.error('DOMContentLoaded handler error:',e);}}
+                }
+            })();"#,
+            "<DOMContentLoaded>",
+        );
+
         js_rt.cache_raf_tick_fn();
         self.js_runtime = Some(js_rt);
+
+        // Create system tray icon if enabled.
+        if self.args.enable_tray {
+            let tray_config = TrayConfig {
+                enabled: true,
+                tooltip: format!("CanvasX — {}", self.args.source.file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("scene")),
+                ..TrayConfig::default()
+            };
+            self.system_tray = Some(SystemTray::new(&tray_config));
+            log::info!("System tray icon created");
+        }
 
         // Request first frame.
         window.request_redraw();
@@ -416,8 +460,16 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                log::info!("Close requested — shutting down.");
-                event_loop.exit();
+                // If system tray is active, hide window instead of exiting.
+                if self.system_tray.as_ref().map_or(false, |t| t.is_active()) {
+                    if let Some(ref w) = self.window {
+                        w.set_visible(false);
+                        self.window_visible = false;
+                    }
+                } else {
+                    log::info!("Close requested — shutting down.");
+                    event_loop.exit();
+                }
             }
 
             WindowEvent::Resized(new_size) => {
@@ -447,10 +499,11 @@ impl ApplicationHandler for App {
             // --- Input events → InputHandler ---
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.dispatch_input(RawInputEvent::MouseMove {
-                    x: position.x as f32,
-                    y: position.y as f32,
-                });
+                let x = position.x as f32;
+                let y = position.y as f32;
+                // Update context menu hover state.
+                self.devtools.context_menu.update_hover(x, y);
+                self.dispatch_input(RawInputEvent::MouseMove { x, y });
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
@@ -461,6 +514,56 @@ impl ApplicationHandler for App {
                     _ => return,
                 };
                 let (x, y) = self.input_handler.mouse_pos;
+
+                // Intercept clicks for context menu, DevTools badge and panel.
+                if matches!(state, winit::event::ElementState::Pressed)
+                    && matches!(btn, CxMouseButton::Left)
+                {
+                    let vh = self.window.as_ref()
+                        .map(|w| w.inner_size().height as f32 / w.scale_factor() as f32)
+                        .unwrap_or(600.0);
+                    let vw = self.window.as_ref()
+                        .map(|w| w.inner_size().width as f32 / w.scale_factor() as f32)
+                        .unwrap_or(800.0);
+
+                    // Context menu: if open, handle click (action or dismiss).
+                    if self.devtools.context_menu.open {
+                        if let Some(action) = self.devtools.context_menu.click(x, y) {
+                            self.handle_context_action(action, event_loop);
+                        }
+                        return;
+                    }
+
+                    // Check badge click
+                    if self.devtools.hit_test_badge(x, y, vh) {
+                        self.devtools.toggle();
+                        return;
+                    }
+                    // Check tab click (if panel is open)
+                    if let Some(tab) = self.devtools.hit_test_tab(x, y, vw, vh) {
+                        self.devtools.active_tab = tab;
+                        return;
+                    }
+                    // Block clicks from reaching the scene if inside the panel
+                    if self.devtools.hit_test_panel(x, y, vh) {
+                        return;
+                    }
+                }
+
+                // Right-click: show built-in context menu.
+                if matches!(state, winit::event::ElementState::Pressed)
+                    && matches!(btn, CxMouseButton::Right)
+                {
+                    let vh = self.window.as_ref()
+                        .map(|w| w.inner_size().height as f32 / w.scale_factor() as f32)
+                        .unwrap_or(600.0);
+                    let vw = self.window.as_ref()
+                        .map(|w| w.inner_size().width as f32 / w.scale_factor() as f32)
+                        .unwrap_or(800.0);
+                    self.devtools.context_menu.show(x, y, vw, vh);
+                    return;
+                }
+
                 let raw = match state {
                     winit::event::ElementState::Pressed  => RawInputEvent::MouseDown { x, y, button: btn },
                     winit::event::ElementState::Released => RawInputEvent::MouseUp   { x, y, button: btn },
@@ -474,6 +577,16 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
                 };
                 let (x, y) = self.input_handler.mouse_pos;
+
+                // Intercept scroll for DevTools panel.
+                let vh = self.window.as_ref()
+                    .map(|w| w.inner_size().height as f32 / w.scale_factor() as f32)
+                    .unwrap_or(600.0);
+                if self.devtools.hit_test_panel(x, y, vh) {
+                    self.devtools.handle_scroll(dy);
+                    return;
+                }
+
                 self.dispatch_input(RawInputEvent::MouseWheel {
                     x, y, delta_x: dx, delta_y: dy,
                 });
@@ -481,6 +594,14 @@ impl ApplicationHandler for App {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
+                    // Escape dismisses the context menu if open.
+                    if matches!(event.logical_key, winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)) {
+                        if self.devtools.context_menu.open {
+                            self.devtools.context_menu.hide();
+                            return;
+                        }
+                    }
+
                     let mods = Modifiers {
                         ctrl:  self.current_modifiers.control_key(),
                         shift: self.current_modifiers.shift_key(),
@@ -516,11 +637,85 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Handle a context menu action.
+    fn handle_context_action(&mut self, action: ContextAction, event_loop: &ActiveEventLoop) {
+        match action {
+            ContextAction::ToggleDevTools => {
+                self.devtools.toggle();
+            }
+            ContextAction::Reload => {
+                self.reload_scene();
+            }
+            ContextAction::Exit => {
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// Reload the scene document (re-compile HTML/CSS and re-init JS).
+    fn reload_scene(&mut self) {
+        log::info!("Reloading scene...");
+        match self.load_scene() {
+            Ok((doc, scripts, css_rules)) => {
+                if let Some(ref mut scene) = self.scene {
+                    scene.load_document(doc.clone());
+                }
+                // Re-initialize JS runtime with the newly compiled document.
+                let css_variables: std::collections::HashMap<String, String> =
+                    doc.variables.iter().cloned().collect();
+                let mut js_rt = JsRuntime::new(doc, css_rules, css_variables);
+
+                if let Some(ref w) = self.window {
+                    let vw = w.inner_size().width;
+                    let vh = w.inner_size().height;
+                    js_rt.init_canvases(vw, vh);
+                }
+
+                let source_dir = self.args.source.parent().map(|p| p.to_path_buf());
+                for script in &scripts {
+                    if let Some(ref src) = script.src {
+                        let script_path = if let Some(ref dir) = source_dir {
+                            dir.join(src)
+                        } else {
+                            PathBuf::from(src)
+                        };
+                        js_rt.execute_file(&script_path);
+                    } else if !script.content.is_empty() {
+                        js_rt.execute(&script.content, "<inline>");
+                    }
+                }
+
+                js_rt.execute(
+                    r#"(function(){
+                        if(typeof __cx_globalListeners==='object' && __cx_globalListeners['DOMContentLoaded']){
+                            var fns=__cx_globalListeners['DOMContentLoaded'].slice();
+                            for(var i=0;i<fns.length;i++){try{fns[i]({type:'DOMContentLoaded'});}catch(e){console.error('DOMContentLoaded handler error:',e);}}
+                        }
+                    })();"#,
+                    "<DOMContentLoaded>",
+                );
+
+                js_rt.cache_raf_tick_fn();
+                self.canvas_texture_slots.clear();
+                self.node_canvas_map.clear();
+                self.next_canvas_slot = 10000;
+                self.js_runtime = Some(js_rt);
+                self.devtools.console.entries.clear();
+                log::info!("Scene reloaded");
+            }
+            Err(e) => {
+                log::error!("Reload failed: {}", e);
+            }
+        }
+    }
+
     /// Forward a raw input event to the InputHandler and process resulting UI events.
     fn dispatch_input(&mut self, raw: RawInputEvent) {
         let Some(ref mut scene) = self.scene else { return };
         let ui_events = self.input_handler.process_event(&mut scene.document, raw);
         let had_events = !ui_events.is_empty();
+
+        let mut click_node_ids: Vec<u32> = Vec::new();
 
         for event in ui_events {
             match event {
@@ -535,8 +730,20 @@ impl App {
                     #[cfg(target_os = "windows")]
                     { let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn(); }
                 }
+                canvasx_runtime::scene::input_handler::UiEvent::Click { node_id } => {
+                    click_node_ids.push(node_id);
+                }
                 other => {
                     log::debug!("UI event: {:?}", other);
+                }
+            }
+        }
+
+        // Forward click events to JS addEventListener callbacks.
+        if !click_node_ids.is_empty() {
+            if let Some(ref mut js_rt) = self.js_runtime {
+                for nid in click_node_ids {
+                    js_rt.dispatch_dom_event(nid, "click");
                 }
             }
         }
@@ -575,6 +782,7 @@ impl App {
             if elapsed >= 2.0 {
                 let fps = self.frame_count as f64 / elapsed;
                 log::debug!("FPS: {:.1}", fps);
+                self.devtools.fps = fps as f32;
                 self.frame_count = 0;
                 self.fps_timer = Instant::now();
             }
@@ -583,11 +791,62 @@ impl App {
         // Sync IPC data.
         self.sync_ipc_data();
 
+        // Poll system tray events.
+        if let Some(ref tray) = self.system_tray {
+            for event in tray.poll_events() {
+                match event {
+                    TrayEvent::ShowWindow | TrayEvent::ToggleWindow => {
+                        if let Some(ref w) = self.window {
+                            self.window_visible = !self.window_visible;
+                            w.set_visible(self.window_visible);
+                            if self.window_visible {
+                                w.focus_window();
+                            }
+                        }
+                    }
+                    TrayEvent::Exit => {
+                        std::process::exit(0);
+                    }
+                    TrayEvent::Reload => {
+                        self.reload_scene();
+                    }
+                    TrayEvent::CustomAction(id) => {
+                        // Forward custom tray actions to JS as a 'trayaction' event.
+                        if let Some(ref mut js_rt) = self.js_runtime {
+                            js_rt.execute(
+                                &format!(
+                                    r#"(function(){{
+                                        if(typeof __cx_globalListeners==='object' && __cx_globalListeners['trayaction']){{
+                                            var fns=__cx_globalListeners['trayaction'].slice();
+                                            for(var i=0;i<fns.length;i++){{try{{fns[i]({{type:'trayaction',id:'{}'}});}}catch(e){{}}}}
+                                        }}
+                                    }})()"#,
+                                    id.replace('\'', "\\'")
+                                ),
+                                "<tray>",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Tick JS runtime (requestAnimationFrame, timers, etc.).
         if let Some(ref mut js_rt) = self.js_runtime {
             // Prevent unbounded per-frame gradient allocations from JS canvas code.
             js_rt.gc_gradients();
             let _js_dirty = js_rt.tick(dt);
+
+            // Drain JS console messages into DevTools.
+            for (level, msg) in js_rt.drain_console() {
+                let log_level = match level {
+                    0 => canvasx_runtime::devtools::console::LogLevel::Log,
+                    2 => canvasx_runtime::devtools::console::LogLevel::Warn,
+                    3 => canvasx_runtime::devtools::console::LogLevel::Error,
+                    _ => canvasx_runtime::devtools::console::LogLevel::Info,
+                };
+                self.devtools.console.log(log_level, msg);
+            }
 
             // If JS modified the DOM, sync document back to scene.
             if js_rt.take_layout_dirty() {
@@ -669,6 +928,7 @@ impl App {
         });
 
         let patched_instances;
+        let mut combined_instances;
         let final_instances: &[UiInstance] = if has_canvas_patches {
             patched_instances = instances.iter().map(|inst| {
                 if inst.texture_index <= -2
@@ -688,11 +948,68 @@ impl App {
             instances
         };
 
+        // Append DevTools overlay instances (badge + panel) on top of everything.
+        self.devtools.instance_count = final_instances.len() as u32;
+        let devtools_instances = self.devtools.paint(&scene.document, vw, vh);
+        let final_instances: &[UiInstance] = if devtools_instances.is_empty() {
+            final_instances
+        } else {
+            combined_instances = final_instances.to_vec();
+            combined_instances.extend(devtools_instances);
+            &combined_instances
+        };
+
         let text_areas = scene.text_areas();
+
+        // Prepare DevTools text entries for rendering alongside scene text.
+        let devtools_text_entries = self.devtools.text_entries(&scene.document, vw, vh);
+        let mut devtools_buffers: Vec<glyphon::Buffer> = Vec::new();
+        for entry in &devtools_text_entries {
+            let font_size = entry.font_size;
+            let line_height = font_size * 1.3;
+            let metrics = glyphon::Metrics::new(font_size, line_height);
+            let mut buffer = glyphon::Buffer::new(&mut renderer.font_system, metrics);
+            let weight = if entry.bold { glyphon::Weight(700) } else { glyphon::Weight(400) };
+            let attrs = glyphon::Attrs::new()
+                .family(glyphon::Family::SansSerif)
+                .weight(weight);
+            buffer.set_size(&mut renderer.font_system, Some(entry.width), None);
+            buffer.set_text(&mut renderer.font_system, &entry.text, &attrs, glyphon::Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut renderer.font_system, false);
+            devtools_buffers.push(buffer);
+        }
+        let mut devtools_text_areas: Vec<glyphon::TextArea<'_>> = Vec::new();
+        for (i, entry) in devtools_text_entries.iter().enumerate() {
+            if let Some(buf) = devtools_buffers.get(i) {
+                let c = entry.color;
+                devtools_text_areas.push(glyphon::TextArea {
+                    buffer: buf,
+                    left: entry.x,
+                    top: entry.y,
+                    scale: 1.0,
+                    bounds: glyphon::TextBounds {
+                        left: entry.x as i32,
+                        top: entry.y as i32,
+                        right: (entry.x + entry.width) as i32,
+                        bottom: (entry.y + entry.font_size * 2.0) as i32,
+                    },
+                    default_color: glyphon::Color::rgba(
+                        (c.r * 255.0) as u8,
+                        (c.g * 255.0) as u8,
+                        (c.b * 255.0) as u8,
+                        (c.a * 255.0) as u8,
+                    ),
+                    custom_glyphs: &[],
+                });
+            }
+        }
+        let mut all_text_areas = text_areas;
+        all_text_areas.extend(devtools_text_areas);
 
         // Begin frame → render → present.
         renderer.begin_frame(ctx, dt, scale);
-        match renderer.render(ctx, final_instances, text_areas, clear_color) {
+        self.devtools.draw_calls = final_instances.len() as u32;
+        match renderer.render(ctx, final_instances, all_text_areas, clear_color) {
             Ok(()) => {}
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 // Reconfigure surface on loss.

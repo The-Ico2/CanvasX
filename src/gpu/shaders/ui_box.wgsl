@@ -83,22 +83,10 @@ fn vs_main(vert: VertexInput, inst: InstanceInput) -> VertexOutput {
 }
 
 // ─── Color space note ───
-// CSS and decoded image/canvas colors enter the renderer as sRGB values.
-// Convert to linear in shader before blending so output matches browser color.
-fn srgb_channel_to_linear(c: f32) -> f32 {
-    if c <= 0.04045 {
-        return c / 12.92;
-    }
-    return pow((c + 0.055) / 1.055, 2.4);
-}
-
-fn srgb_to_linear(rgb: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(
-        srgb_channel_to_linear(rgb.r),
-        srgb_channel_to_linear(rgb.g),
-        srgb_channel_to_linear(rgb.b),
-    );
-}
+// All colors stay in sRGB throughout the pipeline to match browser compositing.
+// Browsers blend in sRGB space (not linear), so we skip gamma conversion.
+// The surface format is non-sRGB (Bgra8Unorm), meaning no automatic
+// linear→sRGB conversion on write — what the shader outputs is displayed as-is.
 
 // ─── SDF: Rounded rectangle ───
 // Returns the signed distance from point `p` to a rounded rectangle
@@ -171,18 +159,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // Sample texture if available
         if (in.flags & FLAG_HAS_TEXTURE) != 0u {
-            // Texture data is premultiplied sRGB. Convert to premultiplied linear.
-            let tex_srgb = textureSample(t_diffuse, s_diffuse, in.uv);
-            var tex_linear = vec4<f32>(0.0, 0.0, 0.0, tex_srgb.a);
-            if tex_srgb.a > 0.0 {
-                let unpremul_srgb = tex_srgb.rgb / tex_srgb.a;
-                let unpremul_linear = srgb_to_linear(unpremul_srgb);
-                tex_linear = vec4<f32>(unpremul_linear * tex_srgb.a, tex_srgb.a);
-            }
-            color = tex_linear * inner_alpha;
+            let tex = textureSample(t_diffuse, s_diffuse, in.uv);
+            color = tex * inner_alpha;
         } else {
-            let bg_linear = srgb_to_linear(bg.rgb);
-            let premul_bg = vec4<f32>(bg_linear * bg.a, bg.a);
+            let premul_bg = vec4<f32>(bg.rgb * bg.a, bg.a);
             color = premul_bg * inner_alpha;
         }
     }
@@ -190,9 +170,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Border — fills the ring between outer and inner rects
     if (in.flags & FLAG_HAS_BORDER) != 0u && bw > 0.0 {
         let border_alpha = max(outer_alpha - inner_alpha, 0.0);
-        let border_linear = srgb_to_linear(in.border_color.rgb);
         let premul_border = vec4<f32>(
-            border_linear * in.border_color.a,
+            in.border_color.rgb * in.border_color.a,
             in.border_color.a
         );
         color = color + premul_border * border_alpha;

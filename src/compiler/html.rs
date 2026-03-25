@@ -47,8 +47,20 @@ pub fn compile_html(
 ) -> anyhow::Result<(CxrdDocument, Vec<ScriptBlock>, Vec<CssRule>)> {
     let mut doc = CxrdDocument::new(name, scene_type);
 
-    // 1. Parse CSS rules.
-    let rules = parse_css(css_source);
+    // 1. Extract inline <style> blocks from the HTML and merge with external CSS.
+    //    This ensures CSS from both <head><style> and <body><style> blocks is captured,
+    //    since the HTML tokenizer intentionally skips <style> tags.
+    let inline_css = extract_inline_styles(html_source);
+    let combined_css = if inline_css.is_empty() {
+        css_source.to_string()
+    } else if css_source.is_empty() {
+        inline_css
+    } else {
+        format!("{}\n{}", css_source, inline_css)
+    };
+
+    // 1b. Parse CSS rules from the combined source.
+    let rules = parse_css(&combined_css);
 
     // 2. Extract CSS custom properties (:root variables).
     let mut variables: HashMap<String, String> = HashMap::new();
@@ -96,6 +108,35 @@ pub fn compile_html(
     propagate_inherited_styles(&mut doc);
 
     Ok((doc, scripts, rules))
+}
+
+/// Extract the content of all `<style>…</style>` blocks from an HTML string.
+///
+/// This captures CSS from both `<head><style>` and inline `<style>` blocks
+/// within `<body>`, ensuring all CSS rules are available to the compiler.
+/// The HTML tokenizer skips `<style>` tags, so this pre-extraction is required.
+fn extract_inline_styles(html: &str) -> String {
+    let mut css = String::new();
+    let lower = html.to_lowercase();
+    let mut search_start = 0;
+    while let Some(open) = lower[search_start..].find("<style") {
+        let abs_open = search_start + open;
+        // Find the end of the opening tag '>'
+        if let Some(gt) = lower[abs_open..].find('>') {
+            let content_start = abs_open + gt + 1;
+            if let Some(close) = lower[content_start..].find("</style>") {
+                let content_end = content_start + close;
+                css.push_str(&html[content_start..content_end]);
+                css.push('\n');
+                search_start = content_end + "</style>".len();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    css
 }
 
 /// Extract document background color from body/html/:root CSS rules.
@@ -169,6 +210,7 @@ struct InheritedProps {
     line_height: f32,
     letter_spacing: f32,
     text_align: TextAlign,
+    white_space: crate::cxrd::style::WhiteSpace,
 }
 
 impl InheritedProps {
@@ -181,6 +223,7 @@ impl InheritedProps {
             line_height: s.line_height,
             letter_spacing: s.letter_spacing,
             text_align: s.text_align,
+            white_space: s.white_space,
         }
     }
 }
@@ -221,6 +264,10 @@ fn propagate_recursive(
         // text-align: inherit if default.
         if node.style.text_align == defaults.text_align {
             node.style.text_align = parent.text_align;
+        }
+        // white-space: inherit if default.
+        if node.style.white_space == defaults.white_space {
+            node.style.white_space = parent.white_space;
         }
     }
 
@@ -601,6 +648,11 @@ fn add_node_recursive(
             if let Some(h) = parsed.attributes.get("height").and_then(|v| v.parse::<f32>().ok()) {
                 style.height = Dimension::Px(h);
             }
+        }
+        // Semantic block-level elements (HTML5) — treated as block containers
+        // by browser UA stylesheets, need explicit listing here.
+        "nav" | "section" | "header" | "footer" | "article" | "main" | "aside" | "figure" | "figcaption" | "ul" | "ol" | "li" => {
+            style.display = Display::Block;
         }
         _ => {} // default Block
     }

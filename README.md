@@ -10,7 +10,7 @@ A standalone GPU-native 2D scene graph renderer for desktop personalization, wid
 
 CanvasX compiles a restricted subset of HTML and CSS into a binary intermediate format (**CXRD** — CanvasX Runtime Document), then renders it directly on the GPU via instanced SDF quads. No browser engine, no WebView, no JavaScript runtime — just a single Rust library that turns markup into pixels.
 
-```
+```bash
 HTML/CSS → Compiler → CXRD Document → Layout → Animate → Paint → GPU Renderer
                                          ↑                           |
                                     IPC (live data)           wgpu (Vulkan/DX12)

@@ -131,11 +131,9 @@ impl TextureManager {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // Use Rgba8Unorm (NOT Srgb) — the surface is non-sRGB, so texel
-            // values must pass through without automatic sRGB→linear decode.
-            // tiny-skia canvas data and decoded images are already sRGB; pairing
-            // them with an sRGB texture caused a one-way gamma darken because the
-            // non-sRGB framebuffer never re-encoded linear→sRGB.
+            // Use Rgba8Unorm (NOT Srgb) — all colors stay in sRGB space
+            // throughout the pipeline to match browser compositing. No automatic
+            // sRGB↔linear conversion should happen on read or write.
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],

@@ -367,7 +367,9 @@ impl AppHost {
             }
 
             PageSource::Inline(html) => {
-                match compile_html(html, "", &route.id, SceneType::ConfigPanel, None) {
+                // Extract <style> blocks from inline HTML so CSS is passed to the compiler.
+                let css = extract_inline_styles(html);
+                match compile_html(html, &css, &route.id, SceneType::ConfigPanel, None) {
                     Ok((d, _, _)) => d,
                     Err(e) => {
                         log::error!("AppHost: failed to compile inline '{}': {}", route.id, e);
@@ -420,6 +422,31 @@ impl AppHost {
 }
 
 // --- Helpers ---
+
+/// Extract the content of all `<style>…</style>` blocks from an HTML string.
+fn extract_inline_styles(html: &str) -> String {
+    let mut css = String::new();
+    let lower = html.to_lowercase();
+    let mut search_start = 0;
+    while let Some(open) = lower[search_start..].find("<style") {
+        let abs_open = search_start + open;
+        // Find the end of the opening tag '>'
+        if let Some(gt) = lower[abs_open..].find('>') {
+            let content_start = abs_open + gt + 1;
+            if let Some(close) = lower[content_start..].find("</style>") {
+                let content_end = content_start + close;
+                css.push_str(&html[content_start..content_end]);
+                css.push('\n');
+                search_start = content_end + "</style>".len();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    css
+}
 
 fn load_html_document(path: &Path, name: &str) -> Result<CxrdDocument, String> {
     let html = std::fs::read_to_string(path)

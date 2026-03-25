@@ -66,15 +66,15 @@ impl GpuContext {
         let queue = Arc::new(queue);
 
         // Pick surface format.
-        // Prefer sRGB format for correct color space handling. Hardware automatically
-        // converts sRGB→linear on read and linear→sRGB on write, eliminating the need
-        // for manual gamma conversions in the shader. This matches browser rendering.
-        // Note: sRGB format works correctly with premultiplied alpha blending.
+        // Use a NON-sRGB format so the GPU does not apply automatic linear→sRGB
+        // conversion on write. CSS/browser compositing blends in sRGB space, and
+        // our shader keeps colors in sRGB throughout, so a non-sRGB surface gives
+        // the most accurate browser-matching output.
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .copied()
             .unwrap_or(caps.formats[0]);
 

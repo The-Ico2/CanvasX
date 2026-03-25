@@ -6,7 +6,7 @@
 use crate::cxrd::document::CxrdDocument;
 use crate::cxrd::node::{NodeId, NodeKind};
 use crate::cxrd::input::InputKind;
-use crate::cxrd::style::{Display, TextAlign, TextTransform};
+use crate::cxrd::style::{Display, TextAlign, TextTransform, WhiteSpace};
 use glyphon::{Attrs, Buffer, Color as GlyphonColor, Family, Metrics, Shaping, TextArea, TextBounds, Weight};
 use glyphon::cosmic_text::Align;
 use std::collections::HashMap;
@@ -153,7 +153,13 @@ impl TextPainter {
                     TextAlign::Left => None, // Left is the default
                 };
 
-                buffer.set_size(font_system, Some(rect.width), None);
+                // Add 1px to buffer width so glyphs at the trailing edge are not
+                // clipped due to font metrics extending past the em-square.
+                let buf_width = match style.white_space {
+                    WhiteSpace::NoWrap | WhiteSpace::Pre => f32::MAX,
+                    _ => rect.width + 1.0,
+                };
+                buffer.set_size(font_system, Some(buf_width), None);
                 buffer.set_text(font_system, &content, &attrs, Shaping::Advanced, alignment);
                 buffer.shape_until_scroll(font_system, false);
 
@@ -273,14 +279,12 @@ impl TextPainter {
             let rect = &node.layout.content_rect;
             let color = &node.style.color;
 
-            // Start with the node's own content rect as bounds.
-            let mut left = rect.x as i32;
-            // Adjust top by baseline offset: glyphon's baseline differs from CSS/browser by ~1-2px.
-            // Add small vertical offset to better match browser rendering (empirically determined).
-            let baseline_offset = 1.0; // Small positive offset moves text down slightly
-            let mut top = (rect.y + baseline_offset) as i32;
-            let mut right = (rect.x + rect.width) as i32;
-            let mut bottom = (rect.y + rect.height) as i32;
+            // Use floor/ceil to prevent fractional-pixel clipping at text edges.
+            let mut left = rect.x.floor() as i32;
+            let baseline_offset = 1.0;
+            let mut top = (rect.y + baseline_offset).floor() as i32;
+            let mut right = (rect.x + rect.width).ceil() as i32;
+            let mut bottom = (rect.y + rect.height).ceil() as i32;
 
             // Intersect with the overflow clip rect from the nearest overflow:hidden ancestor.
             if let Some(clip) = &node.layout.clip {

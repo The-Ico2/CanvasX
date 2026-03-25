@@ -685,6 +685,22 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
             // TODO: parse transition shorthand into TransitionDef
         }
 
+        "white-space" => {
+            use crate::cxrd::style::WhiteSpace;
+            style.white_space = match value {
+                "nowrap" => WhiteSpace::NoWrap,
+                "pre" => WhiteSpace::Pre,
+                "pre-wrap" => WhiteSpace::PreWrap,
+                _ => WhiteSpace::Normal,
+            };
+        }
+
+        "cursor" | "text-decoration" | "text-decoration-line" | "font-variant-numeric"
+        | "font-variant" | "list-style" | "list-style-type" | "outline" | "outline-style"
+        | "appearance" => {
+            // Silently ignore properties that don't affect layout or rendering.
+        }
+
         _ => {
             // Unsupported property — silently ignore.
             log::debug!("Unsupported CSS property: {}", property);

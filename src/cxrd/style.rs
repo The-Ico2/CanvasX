@@ -152,6 +152,21 @@ impl Default for TextTransform {
     }
 }
 
+/// White-space handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WhiteSpace {
+    Normal,
+    NoWrap,
+    Pre,
+    PreWrap,
+}
+
+impl Default for WhiteSpace {
+    fn default() -> Self {
+        WhiteSpace::Normal
+    }
+}
+
 /// A CSS grid track size.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GridTrackSize {
@@ -310,6 +325,7 @@ pub struct ComputedStyle {
     pub text_align: TextAlign,
     pub letter_spacing: f32,
     pub text_transform: TextTransform,
+    pub white_space: WhiteSpace,
 
     // --- Transitions ---
     pub transitions: Vec<TransitionDef>,
@@ -387,6 +403,7 @@ impl Default for ComputedStyle {
             text_align: TextAlign::default(),
             letter_spacing: 0.0,
             text_transform: TextTransform::default(),
+            white_space: WhiteSpace::default(),
             transitions: Vec::new(),
             z_index: 0,
         }

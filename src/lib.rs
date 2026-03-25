@@ -21,6 +21,9 @@ pub mod animate;
 pub mod ipc;
 pub mod platform;
 pub mod scripting;
+pub mod devtools;
+pub mod capabilities;
+pub mod tray;
 
 /// Re-export key types for external consumers.
 pub use cxrd::document::CxrdDocument;
@@ -31,3 +34,6 @@ pub use scene::graph::SceneGraph;
 pub use scene::input_handler::{InputHandler, RawInputEvent, UiEvent};
 pub use scene::app_host::{AppHost, AppEvent, SentinelAppBuilder};
 pub use compiler::editable::EditableContext;
+pub use devtools::DevTools;
+pub use capabilities::{CapabilitySet, NetworkAccess, StorageAccess, IpcAccess, SystemInfo, FileSystemAccess, DeviceAccess};
+pub use tray::{SystemTray, TrayConfig, TrayMenu, TrayMenuEntry, TrayMenuItem, TrayItemStack, TrayMenuAction, TrayEvent};
