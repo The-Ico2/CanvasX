@@ -18,6 +18,9 @@ pub struct TrayConfig {
     /// Optional path to a custom tray icon (.png, 32-bit RGBA).
     /// If `None`, uses a built-in CanvasX icon.
     pub icon_path: Option<PathBuf>,
+    /// Optional inline RGBA icon data (bytes, width, height).
+    /// Takes priority over `icon_path` when set.
+    pub icon_rgba: Option<(Vec<u8>, u32, u32)>,
     /// Tooltip text shown on hover.
     pub tooltip: String,
     /// Menu entries shown on right-click.
@@ -29,6 +32,7 @@ impl Default for TrayConfig {
         Self {
             enabled: false,
             icon_path: None,
+            icon_rgba: None,
             tooltip: "CanvasX".to_string(),
             menu: TrayMenu::default(),
         }
@@ -278,7 +282,9 @@ impl SystemTray {
         menu.append(&exit_item)?;
 
         // Load icon — try custom path first, then fallback to a generated icon.
-        let icon = if let Some(ref icon_path) = config.icon_path {
+        let icon = if let Some((rgba, w, h)) = config.icon_rgba.clone() {
+            tray_icon::Icon::from_rgba(rgba, w, h)?
+        } else if let Some(ref icon_path) = config.icon_path {
             load_icon_from_file(icon_path)?
         } else {
             create_default_icon()

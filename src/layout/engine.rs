@@ -55,10 +55,11 @@ fn layout_node_recursive(
 
     let style = node.style.clone();
     let container_rect = node.layout.content_rect;
+    let scroll_y = node.layout.scroll_y;
     let children: Vec<NodeId> = node.children.clone();
 
-    // Set clip for overflow: hidden containers.
-    let child_clip = if matches!(style.overflow, crate::cxrd::style::Overflow::Hidden) {
+    // Set clip for overflow: hidden or scroll containers.
+    let child_clip = if matches!(style.overflow, crate::cxrd::style::Overflow::Hidden | crate::cxrd::style::Overflow::Scroll) {
         Some(container_rect)
     } else {
         clip
@@ -104,6 +105,21 @@ fn layout_node_recursive(
         // Set clip on children.
         if let Some(child) = doc.nodes.get_mut(child_id as usize) {
             child.layout.clip = child_clip;
+        }
+    }
+
+    // Apply scroll offset: shift all non-absolute children by -scroll_y.
+    if scroll_y.abs() > 0.01 {
+        for &child_id in &children {
+            if let Some(child) = doc.nodes.get(child_id as usize) {
+                if matches!(child.style.position, Position::Absolute | Position::Fixed) {
+                    continue;
+                }
+            }
+            if let Some(child) = doc.nodes.get_mut(child_id as usize) {
+                child.layout.rect.y -= scroll_y;
+                child.layout.content_rect.y -= scroll_y;
+            }
         }
     }
 

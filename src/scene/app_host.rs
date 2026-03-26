@@ -194,6 +194,8 @@ pub enum AppEvent {
     MaximizeToggleRequested,
     /// Open external URL in system browser.
     OpenExternal(String),
+    /// Tray: always show the window.
+    TrayShowWindow,
     /// Tray: toggle window visibility.
     TrayToggleWindow,
     /// Tray: custom action fired.
@@ -570,6 +572,12 @@ impl AppHost {
                 if is_mouse_move && page.input_handler.hovered != prev_hovered {
                     page.scene.invalidate_paint();
                 }
+
+                // If scrolling occurred, re-layout to apply the new scroll offset.
+                if page.input_handler.scroll_dirty {
+                    page.input_handler.scroll_dirty = false;
+                    page.scene.invalidate_layout();
+                }
             }
         }
     }
@@ -604,7 +612,11 @@ impl AppHost {
         if let Some(ref tray) = self.system_tray {
             for event in tray.poll_events() {
                 match event {
-                    TrayEvent::ShowWindow | TrayEvent::ToggleWindow => {
+                    TrayEvent::ShowWindow => {
+                        self.window_visible = true;
+                        self.pending_events.push(AppEvent::TrayShowWindow);
+                    }
+                    TrayEvent::ToggleWindow => {
                         self.window_visible = !self.window_visible;
                         self.pending_events.push(AppEvent::TrayToggleWindow);
                     }
@@ -739,6 +751,16 @@ impl AppHost {
             ..TrayConfig::default()
         };
         self.system_tray = Some(SystemTray::new(&tray_config));
+        log::info!("System tray created for '{}'", tooltip);
+    }
+
+    /// Initialise system tray with a custom configuration.
+    pub fn init_tray_with_config(&mut self, config: TrayConfig) {
+        if !self.capabilities.has_tray() {
+            return;
+        }
+        let tooltip = config.tooltip.clone();
+        self.system_tray = Some(SystemTray::new(&config));
         log::info!("System tray created for '{}'", tooltip);
     }
 
@@ -979,6 +1001,38 @@ impl AppHost {
     /// Whether this host has system tray active (for close behavior).
     pub fn has_active_tray(&self) -> bool {
         self.system_tray.as_ref().map_or(false, |t| t.is_active())
+    }
+
+    /// Poll tray events without doing a full tick.
+    ///
+    /// Use in `about_to_wait()` so tray events (especially Exit) are processed
+    /// even when the window is hidden and `RedrawRequested` never fires.
+    pub fn poll_tray(&mut self) -> Vec<AppEvent> {
+        let mut events = Vec::new();
+        if let Some(ref tray) = self.system_tray {
+            for event in tray.poll_events() {
+                match event {
+                    TrayEvent::ShowWindow => {
+                        self.window_visible = true;
+                        events.push(AppEvent::TrayShowWindow);
+                    }
+                    TrayEvent::ToggleWindow => {
+                        self.window_visible = !self.window_visible;
+                        events.push(AppEvent::TrayToggleWindow);
+                    }
+                    TrayEvent::Exit => {
+                        events.push(AppEvent::CloseRequested);
+                    }
+                    TrayEvent::Reload => {
+                        self.reload_active_page();
+                    }
+                    TrayEvent::CustomAction(id) => {
+                        events.push(AppEvent::TrayAction(id));
+                    }
+                }
+            }
+        }
+        events
     }
 
     // --- Internal ---

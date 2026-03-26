@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use crate::cxrd::document::CxrdDocument;
 use crate::cxrd::node::{NodeId, NodeKind, EventAction};
 use crate::cxrd::input::{InputKind, InteractionState, FocusState};
+use crate::cxrd::style::Overflow;
 use crate::cxrd::value::Rect;
 
 /// Mouse button identifiers.
@@ -110,6 +111,8 @@ pub struct InputHandler {
     pending_events: Vec<UiEvent>,
     /// The current cursor style hint.
     pub cursor: CursorIcon,
+    /// Set when a scroll event changed a node's scroll_y (caller should invalidate layout).
+    pub scroll_dirty: bool,
 }
 
 /// Cursor icon hints for the platform layer.
@@ -139,6 +142,7 @@ impl InputHandler {
             mouse_pos: (0.0, 0.0),
             pending_events: Vec::new(),
             cursor: CursorIcon::Default,
+            scroll_dirty: false,
         }
     }
 
@@ -338,14 +342,37 @@ impl InputHandler {
         }
     }
 
-    fn handle_scroll(&mut self, doc: &CxrdDocument, x: f32, y: f32, _dx: f32, dy: f32) {
-        // Find the nearest scroll container ancestor at (x, y).
-        if let Some(node_id) = self.find_scroll_container(doc, x, y) {
-            let state = self.states.entry(node_id).or_default();
-            state.scroll_y = (state.scroll_y - dy * 40.0).max(0.0);
-            // Clamp to content size.
-            let max = (state.content_height - state.scroll_y).max(0.0);
-            state.scroll_y = state.scroll_y.min(max);
+    fn handle_scroll(&mut self, doc: &mut CxrdDocument, _x: f32, _y: f32, _dx: f32, dy: f32) {
+        let (mx, my) = self.mouse_pos;
+        // Find the nearest scroll container ancestor at the cursor.
+        if let Some(node_id) = self.find_scroll_container(doc, mx, my) {
+            // Compute content height from children's layout rects.
+            let content_height = if let Some(node) = doc.get_node(node_id) {
+                let container_top = node.layout.content_rect.y;
+                let container_height = node.layout.content_rect.height;
+                let mut max_bottom: f32 = 0.0;
+                for &child_id in &node.children {
+                    if let Some(child) = doc.get_node(child_id) {
+                        // Children's rect.y already includes the previous scroll offset,
+                        // so add it back to get the unscrolled bottom.
+                        let child_bottom = child.layout.rect.y + child.layout.rect.height
+                            - container_top + node.layout.scroll_y;
+                        max_bottom = max_bottom.max(child_bottom);
+                    }
+                }
+                // Scrollable distance is content that exceeds the container.
+                (max_bottom - container_height).max(0.0)
+            } else {
+                0.0
+            };
+
+            if let Some(node) = doc.nodes.get_mut(node_id as usize) {
+                let old_scroll = node.layout.scroll_y;
+                node.layout.scroll_y = (node.layout.scroll_y - dy).clamp(0.0, content_height);
+                if (node.layout.scroll_y - old_scroll).abs() > 0.01 {
+                    self.scroll_dirty = true;
+                }
+            }
         }
     }
 
@@ -373,9 +400,10 @@ impl InputHandler {
             }
         }
 
-        // Is this node a scroll container?
+        // A node is a scroll container if it has overflow: scroll or is a ScrollContainer kind.
         match &node.kind {
             NodeKind::ScrollContainer { .. } => Some(node_id),
+            _ if matches!(node.style.overflow, Overflow::Scroll) => Some(node_id),
             _ => None,
         }
     }
@@ -391,11 +419,17 @@ impl InputHandler {
         // Track whether event bindings were found on the clicked node.
         let mut found_bindings = false;
 
+        // Collect actions to execute (clone to avoid holding node borrow).
+        let mut toggle_classes: Vec<(NodeId, String, String)> = Vec::new();
+
         // Dispatch compiled event bindings.
         for binding in &node.events {
             if binding.event == "click" {
                 found_bindings = true;
                 match &binding.action {
+                    EventAction::ToggleClass { target, class, target_html_id } => {
+                        toggle_classes.push((*target, class.clone(), target_html_id.clone()));
+                    }
                     EventAction::IpcCommand { ns, cmd, args } => {
                         self.pending_events.push(UiEvent::IpcCommand {
                             ns: ns.clone(),
@@ -415,6 +449,24 @@ impl InputHandler {
             }
         }
 
+        // Execute ToggleClass actions on the document.
+        for (target, class, target_html_id) in toggle_classes {
+            let resolved = if !target_html_id.is_empty() {
+                Self::find_node_by_html_id(doc, &target_html_id).unwrap_or(node_id)
+            } else if target == 0 {
+                node_id
+            } else {
+                target
+            };
+            if let Some(target_node) = doc.nodes.get_mut(resolved as usize) {
+                if let Some(pos) = target_node.classes.iter().position(|c| c == &class) {
+                    target_node.classes.remove(pos);
+                } else {
+                    target_node.classes.push(class);
+                }
+            }
+        }
+
         // Event bubbling: if the clicked node had no click bindings,
         // walk up the parent chain to find an ancestor with handlers.
         if !found_bindings {
@@ -430,16 +482,20 @@ impl InputHandler {
 
     /// Walk up from `child_id` through parent nodes, dispatching click event
     /// bindings on the first ancestor that has them (event bubbling).
-    fn bubble_click_to_parent(&mut self, doc: &CxrdDocument, child_id: NodeId) {
+    fn bubble_click_to_parent(&mut self, doc: &mut CxrdDocument, child_id: NodeId) {
         // Find parent that contains child_id.
         let mut current = child_id;
         while let Some(parent_id) = self.find_parent(doc, doc.root, current) {
             if let Some(parent) = doc.get_node(parent_id) {
                 let mut found = false;
+                let mut toggle_classes: Vec<(NodeId, String, String)> = Vec::new();
                 for binding in &parent.events {
                     if binding.event == "click" {
                         found = true;
                         match &binding.action {
+                            EventAction::ToggleClass { target, class, target_html_id } => {
+                                toggle_classes.push((*target, class.clone(), target_html_id.clone()));
+                            }
                             EventAction::IpcCommand { ns, cmd, args } => {
                                 self.pending_events.push(UiEvent::IpcCommand {
                                     ns: ns.clone(),
@@ -455,6 +511,23 @@ impl InputHandler {
                             other => {
                                 self.pending_events.push(UiEvent::Action(other.clone()));
                             }
+                        }
+                    }
+                }
+                // Execute ToggleClass actions on the document.
+                for (target, class, target_html_id) in toggle_classes {
+                    let resolved = if !target_html_id.is_empty() {
+                        Self::find_node_by_html_id(doc, &target_html_id).unwrap_or(parent_id)
+                    } else if target == 0 {
+                        parent_id
+                    } else {
+                        target
+                    };
+                    if let Some(target_node) = doc.nodes.get_mut(resolved as usize) {
+                        if let Some(pos) = target_node.classes.iter().position(|c| c == &class) {
+                            target_node.classes.remove(pos);
+                        } else {
+                            target_node.classes.push(class);
                         }
                     }
                 }
@@ -475,6 +548,16 @@ impl InputHandler {
             }
             if let Some(found) = self.find_parent(doc, child_id, target) {
                 return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Find a node by its HTML `id` attribute.
+    fn find_node_by_html_id(doc: &CxrdDocument, html_id: &str) -> Option<NodeId> {
+        for (i, node) in doc.nodes.iter().enumerate() {
+            if node.html_id.as_deref() == Some(html_id) {
+                return Some(i as NodeId);
             }
         }
         None

@@ -133,12 +133,14 @@ pub struct LayoutResult {
     pub rect: Rect,
     /// Content box (rect minus padding and border).
     pub content_rect: Rect,
-    /// Clip rect from nearest overflow:hidden ancestor.
+    /// Clip rect from nearest overflow:hidden/scroll ancestor.
     pub clip: Option<Rect>,
     /// Resolved padding in px.
     pub padding: crate::cxrd::value::EdgeInsets,
     /// Resolved margin in px.
     pub margin: crate::cxrd::value::EdgeInsets,
+    /// Scroll offset (set by InputHandler, read by layout engine).
+    pub scroll_y: f32,
 }
 
 /// An event binding compiled from JS.
@@ -156,7 +158,9 @@ pub struct EventBinding {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventAction {
     /// Toggle a CSS class on a target node.
-    ToggleClass { target: NodeId, class: String },
+    /// `target` is a NodeId (0 = self). `target_html_id` can specify an HTML id
+    /// to resolve at runtime (e.g. "sidebar").
+    ToggleClass { target: NodeId, class: String, #[serde(default)] target_html_id: String },
     /// Set a CSS class on a target node.
     SetClass { target: NodeId, class: String },
     /// Remove a CSS class from a target node.

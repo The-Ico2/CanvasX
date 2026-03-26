@@ -1088,7 +1088,11 @@ fn extract_event_bindings(parsed: &ParsedNode) -> Vec<EventBinding> {
             "toggle-class" => {
                 let class = parsed.attributes.get("data-class")
                     .cloned().unwrap_or_default();
-                EventAction::ToggleClass { target: 0, class }
+                // target: resolved later; 0 means "self" (the node with this binding).
+                // data-target can specify an HTML id to resolve at runtime.
+                let target_id = parsed.attributes.get("data-target")
+                    .cloned().unwrap_or_default();
+                EventAction::ToggleClass { target: 0, class, target_html_id: target_id }
             }
             "window-close" => EventAction::WindowClose,
             "window-minimize" => EventAction::WindowMinimize,

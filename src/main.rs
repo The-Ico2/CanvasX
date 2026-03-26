@@ -648,6 +648,38 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Poll tray events directly — request_redraw() may not trigger
+        // RedrawRequested for hidden windows on Windows.
+        if let Some(ref tray) = self.system_tray {
+            for event in tray.poll_events() {
+                match event {
+                    TrayEvent::ShowWindow => {
+                        if let Some(ref w) = self.window {
+                            self.window_visible = true;
+                            w.set_visible(true);
+                            w.focus_window();
+                        }
+                    }
+                    TrayEvent::ToggleWindow => {
+                        if let Some(ref w) = self.window {
+                            self.window_visible = !self.window_visible;
+                            w.set_visible(self.window_visible);
+                            if self.window_visible {
+                                w.focus_window();
+                            }
+                        }
+                    }
+                    TrayEvent::Exit => {
+                        self.exit_requested = true;
+                    }
+                    TrayEvent::Reload => {
+                        self.reload_scene();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Ensure redraws continue even when window is hidden (for tray event polling).
         if let Some(ref w) = self.window {
             w.request_redraw();
@@ -814,6 +846,12 @@ impl App {
             scene.invalidate_layout();
         }
 
+        // If scrolling occurred, re-layout to apply the new scroll offset.
+        if self.input_handler.scroll_dirty {
+            self.input_handler.scroll_dirty = false;
+            scene.invalidate_layout();
+        }
+
         // Apply updated cursor icon.
         if let Some(ref w) = self.window {
             let winit_cursor = match self.input_handler.cursor {
@@ -854,7 +892,14 @@ impl App {
         if let Some(ref tray) = self.system_tray {
             for event in tray.poll_events() {
                 match event {
-                    TrayEvent::ShowWindow | TrayEvent::ToggleWindow => {
+                    TrayEvent::ShowWindow => {
+                        if let Some(ref w) = self.window {
+                            self.window_visible = true;
+                            w.set_visible(true);
+                            w.focus_window();
+                        }
+                    }
+                    TrayEvent::ToggleWindow => {
                         if let Some(ref w) = self.window {
                             self.window_visible = !self.window_visible;
                             w.set_visible(self.window_visible);
