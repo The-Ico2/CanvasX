@@ -26,6 +26,7 @@ use crate::devtools::DevTools;
 use crate::devtools::context_menu::ContextAction;
 use crate::devtools::debug_server::DebugServer;
 use crate::gpu::vertex::UiInstance;
+use crate::instance::InstanceGuard;
 use crate::scene::graph::SceneGraph;
 use crate::scene::input_handler::{InputHandler, RawInputEvent, UiEvent, MouseButton as CxMouseButton};
 use crate::scripting::JsRuntime;
@@ -165,6 +166,9 @@ pub struct AppHost {
     title_bar: Option<TitleBarInstance>,
     /// Whether a custom title bar was detected (signals to disable native decorations).
     pub has_custom_title_bar: bool,
+    /// Single-instance guard (holds mutex + pipe listener). Only present when
+    /// `SingleInstance` capability is declared and the lock was acquired.
+    instance_guard: Option<InstanceGuard>,
 }
 
 /// A compiled custom title bar scene.
@@ -236,6 +240,7 @@ impl AppHost {
             debug_server: DebugServer::new(),
             title_bar: None,
             has_custom_title_bar: false,
+            instance_guard: None,
         }
     }
 
@@ -360,6 +365,16 @@ impl AppHost {
     /// Get the active page ID.
     pub fn active_page(&self) -> Option<&str> {
         self.active_page.as_deref()
+    }
+
+    /// Get icon declarations from the active page's document.
+    pub fn icon_declarations(&self) -> &[crate::cxrd::document::IconDecl] {
+        if let Some(ref page_id) = self.active_page {
+            if let Some(page) = self.pages.get(page_id) {
+                return &page.scene.document.icons;
+            }
+        }
+        &[]
     }
 
     /// Get the list of registered routes.
@@ -578,6 +593,21 @@ impl AppHost {
                     page.input_handler.scroll_dirty = false;
                     page.scene.invalidate_layout();
                 }
+
+                // If a class was toggled, re-apply CSS rules so styles reflect the new class.
+                if page.input_handler.class_dirty {
+                    page.input_handler.class_dirty = false;
+                    crate::compiler::html::reapply_all_styles(
+                        &mut page.scene.document,
+                        &page.css_rules,
+                    );
+                    page.scene.invalidate_layout();
+                    // Sync toggled classes back to JS runtime so merge_js_document
+                    // doesn't overwrite them on the next tick.
+                    if let Some(ref js_rt) = self.js_runtime {
+                        js_rt.sync_document(&page.scene.document);
+                    }
+                }
             }
         }
     }
@@ -608,30 +638,8 @@ impl AppHost {
             }
         }
 
-        // Poll system tray events.
-        if let Some(ref tray) = self.system_tray {
-            for event in tray.poll_events() {
-                match event {
-                    TrayEvent::ShowWindow => {
-                        self.window_visible = true;
-                        self.pending_events.push(AppEvent::TrayShowWindow);
-                    }
-                    TrayEvent::ToggleWindow => {
-                        self.window_visible = !self.window_visible;
-                        self.pending_events.push(AppEvent::TrayToggleWindow);
-                    }
-                    TrayEvent::Exit => {
-                        self.pending_events.push(AppEvent::CloseRequested);
-                    }
-                    TrayEvent::Reload => {
-                        self.reload_active_page();
-                    }
-                    TrayEvent::CustomAction(id) => {
-                        self.pending_events.push(AppEvent::TrayAction(id));
-                    }
-                }
-            }
-        }
+        // Tray events are handled exclusively by `poll_tray()` (called from
+        // `about_to_wait`) to avoid a double-poll race when the window is hidden.
 
         // Tick JS runtime (requestAnimationFrame, timers, etc.).
         if let Some(ref mut js_rt) = self.js_runtime {
@@ -657,6 +665,11 @@ impl AppHost {
                         let js_doc = js_rt.document();
                         page.scene.merge_js_document(&js_doc);
                         drop(js_doc);
+                        // Apply CSS rules to any newly created/changed nodes.
+                        crate::compiler::html::reapply_all_styles(
+                            &mut page.scene.document,
+                            &page.css_rules,
+                        );
                     }
                 }
             }
@@ -998,17 +1011,50 @@ impl AppHost {
         })
     }
 
+    /// Execute a JS snippet in the page's V8 runtime.
+    pub fn execute_js(&mut self, source: &str) {
+        if let Some(ref mut js_rt) = self.js_runtime {
+            js_rt.execute(source, "<ipc>");
+        }
+    }
+
     /// Whether this host has system tray active (for close behavior).
     pub fn has_active_tray(&self) -> bool {
         self.system_tray.as_ref().map_or(false, |t| t.is_active())
+    }
+
+    /// Attach a single-instance guard obtained from
+    /// `instance::acquire_single_instance()`.
+    ///
+    /// The guard is polled automatically by `poll_tray()` — any focus requests
+    /// from secondary launches are emitted as `AppEvent::TrayShowWindow`.
+    pub fn set_instance_guard(&mut self, guard: InstanceGuard) {
+        self.instance_guard = Some(guard);
+    }
+
+    /// Whether a single-instance guard is active.
+    pub fn has_instance_guard(&self) -> bool {
+        self.instance_guard.is_some()
     }
 
     /// Poll tray events without doing a full tick.
     ///
     /// Use in `about_to_wait()` so tray events (especially Exit) are processed
     /// even when the window is hidden and `RedrawRequested` never fires.
+    ///
+    /// Also polls the single-instance guard for focus requests from secondary
+    /// launches, emitting them as `AppEvent::TrayShowWindow`.
     pub fn poll_tray(&mut self) -> Vec<AppEvent> {
         let mut events = Vec::new();
+
+        // Poll single-instance focus requests.
+        if let Some(ref guard) = self.instance_guard {
+            for _ in guard.poll_focus_requests() {
+                self.window_visible = true;
+                events.push(AppEvent::TrayShowWindow);
+            }
+        }
+
         if let Some(ref tray) = self.system_tray {
             for event in tray.poll_events() {
                 match event {
@@ -1094,6 +1140,11 @@ impl AppHost {
 
         // Transplant new children from fragment document.
         page.scene.document.transplant_children_from(&frag_doc, pc_node_id);
+
+        // Reset scroll position for the new content.
+        if let Some(node) = page.scene.document.get_node_mut(pc_node_id) {
+            node.layout.scroll_y = 0.0;
+        }
 
         // Update the active content attribute.
         if let Some(node) = page.scene.document.get_node_mut(pc_node_id) {

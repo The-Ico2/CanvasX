@@ -511,8 +511,9 @@ impl ApplicationHandler for App {
             // --- Input events → InputHandler ---
 
             WindowEvent::CursorMoved { position, .. } => {
-                let x = position.x as f32;
-                let y = position.y as f32;
+                let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
+                let x = position.x as f32 / scale;
+                let y = position.y as f32 / scale;
                 // Update context menu hover state.
                 self.devtools.context_menu.update_hover(x, y);
                 self.dispatch_input(RawInputEvent::MouseMove { x, y });
@@ -849,6 +850,16 @@ impl App {
         // If scrolling occurred, re-layout to apply the new scroll offset.
         if self.input_handler.scroll_dirty {
             self.input_handler.scroll_dirty = false;
+            scene.invalidate_layout();
+        }
+
+        // If a class was toggled, re-apply CSS rules so styles reflect the new class.
+        if self.input_handler.class_dirty {
+            self.input_handler.class_dirty = false;
+            canvasx_runtime::compiler::html::reapply_all_styles(
+                &mut scene.document,
+                &self.compiled_css_rules,
+            );
             scene.invalidate_layout();
         }
 

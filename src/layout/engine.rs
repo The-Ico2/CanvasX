@@ -496,6 +496,8 @@ fn resolve_track_sizes(templates: &[GridTrackSize], available: f32, num_tracks: 
 
 /// Estimate the content height of a node for auto-sizing.
 /// Recursively sums children heights or uses font metrics for text.
+/// Returns the node's border-box height (padding + border + content), NOT including margins.
+/// Callers are responsible for adding margins when positioning.
 fn estimate_content_height(doc: &CxrdDocument, node_id: NodeId, constraints: &LayoutConstraints) -> f32 {
     let node = match doc.nodes.get(node_id as usize) {
         Some(n) => n,
@@ -514,7 +516,6 @@ fn estimate_content_height(doc: &CxrdDocument, node_id: NodeId, constraints: &La
 
     let padding_v = resolve(cs.padding.top, 0.0) + resolve(cs.padding.bottom, 0.0);
     let border_v = cs.border_width.top + cs.border_width.bottom;
-    let margin_v = resolve(cs.margin.top, 0.0) + resolve(cs.margin.bottom, 0.0);
 
     if node.children.is_empty() {
         // Leaf node: estimate intrinsic height.
@@ -526,13 +527,24 @@ fn estimate_content_height(doc: &CxrdDocument, node_id: NodeId, constraints: &La
                 InputKind::Slider { .. } => 22.0,
                 _ => 30.0,
             };
-            return padding_v + border_v + margin_v + intrinsic;
+            return padding_v + border_v + intrinsic;
         }
 
-        // Text leaf fallback.
+        // Text leaf fallback — estimate wrapped line count.
         let font_size = cs.font_size.max(1.0);
         let line_h = cs.line_height * font_size;
-        return padding_v + border_v + margin_v + line_h;
+        let text_len = match &node.kind {
+            NodeKind::Text { content } => content.len(),
+            _ => 0,
+        };
+        if text_len > 0 {
+            let avg_char_width = font_size * 0.55;
+            let available_width = constraints.max_width.max(1.0);
+            let chars_per_line = (available_width / avg_char_width).max(1.0);
+            let num_lines = (text_len as f32 / chars_per_line).ceil().max(1.0);
+            return padding_v + border_v + (line_h * num_lines);
+        }
+        return padding_v + border_v + line_h;
     }
 
     // Sum children heights (block flow) or max (flex-row).
@@ -551,8 +563,19 @@ fn estimate_content_height(doc: &CxrdDocument, node_id: NodeId, constraints: &La
             }
         }
         let ch = estimate_content_height(doc, child_id, constraints);
-        total_h += ch;
-        if ch > max_h { max_h = ch; }
+        // Add child's margins since they contribute to the parent's content height.
+        let child_margin_v = if let Some(child) = doc.nodes.get(child_id as usize) {
+            let ccs = &child.style;
+            let r = |d: Dimension| -> f32 {
+                d.resolve(0.0, constraints.viewport_width, constraints.viewport_height, ccs.font_size, constraints.root_font_size)
+            };
+            r(ccs.margin.top) + r(ccs.margin.bottom)
+        } else {
+            0.0
+        };
+        total_h += ch + child_margin_v;
+        let ch_with_m = ch + child_margin_v;
+        if ch_with_m > max_h { max_h = ch_with_m; }
         count += 1;
     }
     if count > 1 && (!is_flex_row || (is_wrap_row && is_paragraph_like)) {
@@ -560,7 +583,7 @@ fn estimate_content_height(doc: &CxrdDocument, node_id: NodeId, constraints: &La
     }
 
     let children_h = if is_flex_row && !(is_wrap_row && is_paragraph_like) { max_h } else { total_h };
-    padding_v + border_v + margin_v + children_h
+    padding_v + border_v + children_h
 }
 
 /// Estimate the intrinsic content width of a node (for flex-row auto-basis).

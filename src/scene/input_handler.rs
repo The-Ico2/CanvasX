@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use crate::cxrd::document::CxrdDocument;
 use crate::cxrd::node::{NodeId, NodeKind, EventAction};
 use crate::cxrd::input::{InputKind, InteractionState, FocusState};
-use crate::cxrd::style::Overflow;
+use crate::cxrd::style::{CursorStyle, Overflow};
 use crate::cxrd::value::Rect;
 
 /// Mouse button identifiers.
@@ -113,6 +113,8 @@ pub struct InputHandler {
     pub cursor: CursorIcon,
     /// Set when a scroll event changed a node's scroll_y (caller should invalidate layout).
     pub scroll_dirty: bool,
+    /// Set when a ToggleClass action modified a node's class list (caller should re-apply CSS).
+    pub class_dirty: bool,
 }
 
 /// Cursor icon hints for the platform layer.
@@ -143,6 +145,7 @@ impl InputHandler {
             pending_events: Vec::new(),
             cursor: CursorIcon::Default,
             scroll_dirty: false,
+            class_dirty: false,
         }
     }
 
@@ -283,7 +286,7 @@ impl InputHandler {
         // Update cursor.
         self.cursor = if let Some(node_id) = hit {
             if let Some(node) = doc.get_node(node_id) {
-                cursor_for_node(&node.kind)
+                css_cursor_or_fallback(&node.style.cursor, &node.kind)
             } else {
                 CursorIcon::Default
             }
@@ -464,6 +467,7 @@ impl InputHandler {
                 } else {
                     target_node.classes.push(class);
                 }
+                self.class_dirty = true;
             }
         }
 
@@ -529,6 +533,7 @@ impl InputHandler {
                         } else {
                             target_node.classes.push(class);
                         }
+                        self.class_dirty = true;
                     }
                 }
                 if found {
@@ -901,6 +906,22 @@ fn cursor_for_node(kind: &NodeKind) -> CursorIcon {
             if *disabled { CursorIcon::NotAllowed } else { CursorIcon::Pointer }
         }
         _ => CursorIcon::Default,
+    }
+}
+
+/// Resolve cursor icon: use CSS `cursor` property if set, else fall back to node kind.
+fn css_cursor_or_fallback(css: &CursorStyle, kind: &NodeKind) -> CursorIcon {
+    match css {
+        CursorStyle::Auto => cursor_for_node(kind),
+        CursorStyle::Default => CursorIcon::Default,
+        CursorStyle::Pointer => CursorIcon::Pointer,
+        CursorStyle::Text => CursorIcon::Text,
+        CursorStyle::Move => CursorIcon::Move,
+        CursorStyle::NotAllowed => CursorIcon::NotAllowed,
+        CursorStyle::NsResize => CursorIcon::ResizeNS,
+        CursorStyle::EwResize => CursorIcon::ResizeEW,
+        CursorStyle::Grab | CursorStyle::Grabbing | CursorStyle::CrossHair
+        | CursorStyle::ColResize | CursorStyle::RowResize => cursor_for_node(kind),
     }
 }
 

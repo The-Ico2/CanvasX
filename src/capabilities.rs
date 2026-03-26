@@ -77,6 +77,46 @@ impl Capability for TrayAccess {
     fn description(&self) -> &'static str { "Allows the application to display a system tray icon and menu." }
 }
 
+/// Single-instance capability.
+///
+/// When declared, only one instance of the application can run at a time.
+/// Launching the EXE while already running will bring the existing window
+/// into focus (showing it first if hidden/minimized to tray).
+///
+/// Enforcement uses a named mutex and named pipe on Windows.
+pub struct SingleInstance;
+
+impl Capability for SingleInstance {
+    fn name(&self) -> &'static str { "SingleInstance" }
+    fn description(&self) -> &'static str { "Restricts the application to a single running instance. Re-launching focuses the existing window." }
+}
+
+/// Multi-instance capability.
+///
+/// When declared, the application explicitly supports running multiple
+/// instances simultaneously. All instances share a single system tray
+/// icon, and built-in tray actions (Exit, Reload) apply to every instance.
+///
+/// Custom tray actions can be routed to a specific subset of instances
+/// via `MultiInstanceRouting`.
+pub struct MultiInstance;
+
+impl Capability for MultiInstance {
+    fn name(&self) -> &'static str { "MultiInstance" }
+    fn description(&self) -> &'static str { "Allows multiple instances sharing a single system tray with configurable action routing." }
+}
+
+/// Routing strategy for custom tray actions in multi-instance mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiInstanceRouting {
+    /// Custom actions are sent to all running instances.
+    All,
+    /// Custom actions are sent only to the instance that was last focused.
+    LastFocused,
+    /// Custom actions are sent only to the first instance that was launched.
+    FirstLaunched,
+}
+
 /// A set of declared capabilities for a CanvasX application.
 pub struct CapabilitySet {
     capabilities: Vec<Box<dyn Capability>>,
@@ -111,6 +151,16 @@ impl CapabilitySet {
     /// Check if tray access is declared (convenience method).
     pub fn has_tray(&self) -> bool {
         self.capabilities.iter().any(|c| c.name() == "Tray")
+    }
+
+    /// Check if single-instance mode is declared (convenience method).
+    pub fn has_single_instance(&self) -> bool {
+        self.capabilities.iter().any(|c| c.name() == "SingleInstance")
+    }
+
+    /// Check if multi-instance mode is declared (convenience method).
+    pub fn has_multi_instance(&self) -> bool {
+        self.capabilities.iter().any(|c| c.name() == "MultiInstance")
     }
 
     /// Get all declared capability names.

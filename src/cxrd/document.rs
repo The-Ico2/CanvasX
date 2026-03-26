@@ -66,6 +66,20 @@ pub struct CxrdDocument {
     /// Document title extracted from `<title>` tags (last one wins).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+
+    /// Icon paths declared via `<include type="icon">`.
+    /// `target` is "window", "system", or "" (both).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub icons: Vec<IconDecl>,
+}
+
+/// An icon declaration from `<include type="icon" target="..." src="..." />`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IconDecl {
+    /// "window", "system", or "" (both).
+    pub target: String,
+    /// Resolved filesystem path to the icon file.
+    pub path: String,
 }
 
 /// Document metadata.
@@ -128,6 +142,7 @@ impl CxrdDocument {
             viewport_height: 1080.0,
             redirect: None,
             title: None,
+            icons: Vec::new(),
         }
     }
 

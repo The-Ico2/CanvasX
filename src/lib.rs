@@ -24,6 +24,7 @@ pub mod scripting;
 pub mod devtools;
 pub mod capabilities;
 pub mod tray;
+pub mod instance;
 
 /// Re-export key types for external consumers.
 pub use cxrd::document::CxrdDocument;

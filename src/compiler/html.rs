@@ -106,6 +106,7 @@ fn preprocess_includes_inner(html: &str, base_dir: Option<&Path>, depth: u32) ->
                 let resolve_base = match include_type.as_deref() {
                     Some("component") => base_dir.map(|b| b.join("components")),
                     Some("asset") => base_dir.map(|b| b.join("assets")),
+                    Some("icon") => base_dir.map(|b| b.join("icons")),
                     _ => base_dir.map(|b| b.to_path_buf()),
                 };
 
@@ -115,7 +116,20 @@ fn preprocess_includes_inner(html: &str, base_dir: Option<&Path>, depth: u32) ->
                     Path::new(&src_path).to_path_buf()
                 };
 
-                match std::fs::read_to_string(&resolved) {
+                if include_type.as_deref() == Some("icon") {
+                    // Icon includes: emit a meta tag for extraction at compile time.
+                    let target = extract_attribute(tag_text, "target").unwrap_or_default();
+                    let abs_path = resolved.to_string_lossy().replace('\\', "/");
+                    result.push_str(&format!(
+                        "<meta name=\"icon\" data-target=\"{}\" content=\"{}\" />",
+                        target, abs_path
+                    ));
+                } else {
+                    // Determine if the asset target overrides deferred/immediate.
+                    let target_attr = extract_attribute(tag_text, "target");
+                    let is_immediate = immediate || target_attr.as_deref() == Some("start");
+
+                    match std::fs::read_to_string(&resolved) {
                     Ok(contents) => {
                         let ext = resolved.extension()
                             .and_then(|e| e.to_str())
@@ -130,7 +144,7 @@ fn preprocess_includes_inner(html: &str, base_dir: Option<&Path>, depth: u32) ->
                                 result.push_str("\n</style>");
                             }
                             "js" => {
-                                if immediate {
+                                if is_immediate {
                                     // Immediate: inline as a regular <script>.
                                     result.push_str("<script>\n");
                                     result.push_str(&contents);
@@ -155,6 +169,7 @@ fn preprocess_includes_inner(html: &str, base_dir: Option<&Path>, depth: u32) ->
                         result.push_str(&format!("<!-- include error: {} -->", e));
                     }
                 }
+                } // close icon else
             } else {
                 log::warn!("include tag without src attribute: {}", tag_text);
             }
@@ -258,6 +273,32 @@ fn extract_redirect(html: &str) -> Option<String> {
     None
 }
 
+/// Extract icon declarations from `<meta name="icon" ...>` tags
+/// (emitted by `<include type="icon">` preprocessing).
+fn extract_icons(html: &str) -> Vec<crate::cxrd::document::IconDecl> {
+    let lower = html.to_lowercase();
+    let mut icons = Vec::new();
+    let mut search_pos = 0;
+    while let Some(idx) = lower[search_pos..].find("<meta") {
+        let abs = search_pos + idx;
+        let after = abs + 5;
+        let tag_end = if let Some(gt) = lower[after..].find('>') {
+            after + gt + 1
+        } else {
+            break;
+        };
+        let tag_text = &html[abs..tag_end];
+        if extract_attribute(tag_text, "name").as_deref() == Some("icon") {
+            if let Some(path) = extract_attribute(tag_text, "content") {
+                let target = extract_attribute(tag_text, "data-target").unwrap_or_default();
+                icons.push(crate::cxrd::document::IconDecl { target, path });
+            }
+        }
+        search_pos = tag_end;
+    }
+    icons
+}
+
 /// Extract the document title from `<title>…</title>` tags.
 /// If multiple `<title>` tags exist, the last one wins.
 fn extract_title(html: &str) -> Option<String> {
@@ -350,6 +391,8 @@ pub fn compile_html(
     doc.redirect = extract_redirect(&html_source);
     // 0d. Extract <title> tag (last one wins).
     doc.title = extract_title(&html_source);
+    // 0e. Extract icon declarations from <include type="icon"> meta tags.
+    doc.icons = extract_icons(&html_source);
     let html_source = html_source.as_str();
 
     // 1. Extract inline <style> blocks from the HTML and merge with external CSS.
@@ -1252,6 +1295,156 @@ fn determine_node_kind(parsed: &ParsedNode, _variables: &HashMap<String, String>
 
         _ => NodeKind::Container,
     }
+}
+
+/// Re-apply CSS rules to all nodes in a document (for runtime class toggling).
+/// Resets each node's style to tag defaults, applies CSS rules, then inline styles.
+/// Finishes with inherited style propagation.
+pub fn reapply_all_styles(doc: &mut CxrdDocument, rules: &[CssRule]) {
+    let variables: HashMap<String, String> = doc.variables.iter().cloned().collect();
+    let root = doc.root;
+    // Collect the children list from root (we need to borrow doc mutably later).
+    let root_children: Vec<NodeId> = doc.get_node(root).map(|n| n.children.clone()).unwrap_or_default();
+
+    // Reset and re-apply root node styles.
+    if let Some(node) = doc.get_node_mut(root) {
+        let tag = node.tag.as_deref().unwrap_or("");
+        node.style = tag_default_style(tag);
+        node.hover_style.clear();
+        let html_id = node.html_id.clone();
+        apply_rules_to_node_with_ancestors(node, &html_id, rules, &variables, &[]);
+        reapply_inline_styles(node, &variables);
+    }
+
+    let root_tag = doc.get_node(root).map(|n| n.tag.clone()).unwrap_or(None);
+    let root_classes = doc.get_node(root).map(|n| n.classes.clone()).unwrap_or_default();
+    let root_html_id = doc.get_node(root).and_then(|n| n.html_id.clone());
+    let root_ancestor = AncestorInfo { tag: root_tag, classes: root_classes, html_id: root_html_id };
+
+    for child_id in root_children {
+        reapply_styles_recursive(doc, child_id, rules, &variables, &[root_ancestor.clone()]);
+    }
+
+    // Re-propagate inherited styles (color, font, etc.) from parent to child.
+    propagate_inherited_styles(doc);
+}
+
+fn reapply_styles_recursive(
+    doc: &mut CxrdDocument,
+    node_id: NodeId,
+    rules: &[CssRule],
+    variables: &HashMap<String, String>,
+    ancestors: &[AncestorInfo],
+) {
+    // Collect info we need before borrowing doc mutably.
+    let (children, tag, classes, html_id) = {
+        let node = match doc.get_node(node_id) {
+            Some(n) => n,
+            None => return,
+        };
+        (node.children.clone(), node.tag.clone(), node.classes.clone(), node.html_id.clone())
+    };
+
+    // Reset to tag defaults, apply CSS rules, then inline styles.
+    if let Some(node) = doc.get_node_mut(node_id) {
+        let tag_str = node.tag.as_deref().unwrap_or("");
+        node.style = tag_default_style(tag_str);
+        node.hover_style.clear();
+        apply_rules_to_node_with_ancestors(node, &html_id, rules, variables, ancestors);
+        reapply_inline_styles(node, variables);
+    }
+
+    // Build ancestor chain for children.
+    let mut child_ancestors = ancestors.to_vec();
+    child_ancestors.push(AncestorInfo { tag, classes, html_id });
+
+    for child_id in children {
+        reapply_styles_recursive(doc, child_id, rules, variables, &child_ancestors);
+    }
+}
+
+/// Re-apply inline `style=""` attributes (highest CSS specificity).
+fn reapply_inline_styles(node: &mut CxrdNode, variables: &HashMap<String, String>) {
+    if let Some(inline) = node.attributes.get("style").cloned() {
+        for decl in inline.split(';') {
+            let decl = decl.trim();
+            if let Some((prop, val)) = decl.split_once(':') {
+                apply_property(&mut node.style, prop.trim(), val.trim(), variables);
+            }
+        }
+    }
+}
+
+/// Get the default ComputedStyle for an HTML tag (mirrors add_node_recursive logic).
+fn tag_default_style(tag: &str) -> ComputedStyle {
+    let mut style = ComputedStyle::default();
+    match tag {
+        "#text" | "span" | "a" | "label" | "code" | "small" => {
+            style.display = Display::InlineBlock;
+        }
+        "strong" | "b" => {
+            style.display = Display::InlineBlock;
+            style.font_weight = FontWeight(700);
+        }
+        "em" | "i" => {
+            style.display = Display::InlineBlock;
+        }
+        "h1" => {
+            style.font_size = 32.0;
+            style.font_weight = FontWeight(700);
+            style.margin.top = Dimension::Em(0.67);
+            style.margin.bottom = Dimension::Em(0.67);
+        }
+        "h2" => {
+            style.font_size = 24.0;
+            style.font_weight = FontWeight(700);
+            style.margin.top = Dimension::Em(0.83);
+            style.margin.bottom = Dimension::Em(0.83);
+        }
+        "h3" => {
+            style.font_size = 18.72;
+            style.font_weight = FontWeight(700);
+            style.margin.top = Dimension::Em(1.0);
+            style.margin.bottom = Dimension::Em(1.0);
+        }
+        "h4" => {
+            style.font_size = 16.0;
+            style.font_weight = FontWeight(700);
+            style.margin.top = Dimension::Em(1.33);
+            style.margin.bottom = Dimension::Em(1.33);
+        }
+        "h5" => {
+            style.font_size = 13.28;
+            style.font_weight = FontWeight(700);
+            style.margin.top = Dimension::Em(1.67);
+            style.margin.bottom = Dimension::Em(1.67);
+        }
+        "h6" => {
+            style.font_size = 10.72;
+            style.font_weight = FontWeight(700);
+            style.margin.top = Dimension::Em(2.33);
+            style.margin.bottom = Dimension::Em(2.33);
+        }
+        "p" => {
+            style.display = Display::Flex;
+            style.flex_direction = FlexDirection::Row;
+            style.flex_wrap = crate::cxrd::style::FlexWrap::Wrap;
+            style.align_items = AlignItems::FlexStart;
+            style.margin.top = Dimension::Em(1.0);
+            style.margin.bottom = Dimension::Em(1.0);
+        }
+        "data-bind" => {
+            style.display = Display::InlineBlock;
+        }
+        "data-bar" => {
+            style.display = Display::Block;
+        }
+        "nav" | "section" | "header" | "footer" | "article" | "main" | "aside" | "figure" | "figcaption" | "ul" | "ol" | "li" | "page-content" => {
+            style.display = Display::Block;
+        }
+        _ => {}
+    }
+    style
 }
 
 /// Apply matching CSS rules to a node with ancestor context for descendant matching.
