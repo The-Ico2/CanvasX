@@ -24,6 +24,7 @@ use crate::cxrd::node::NodeId;
 use crate::cxrd::value::Color;
 use crate::devtools::DevTools;
 use crate::devtools::context_menu::ContextAction;
+use crate::devtools::debug_server::DebugServer;
 use crate::gpu::vertex::UiInstance;
 use crate::scene::graph::SceneGraph;
 use crate::scene::input_handler::{InputHandler, RawInputEvent, UiEvent, MouseButton as CxMouseButton};
@@ -158,6 +159,20 @@ pub struct AppHost {
     node_canvas_map: HashMap<NodeId, u32>,
     /// Next available GPU texture slot for canvas textures.
     next_canvas_slot: u32,
+    /// Debug web server for browser-based HTML/CSS inspection.
+    debug_server: DebugServer,
+    /// Optional custom title bar scene (compiled from title-bar.html).
+    title_bar: Option<TitleBarInstance>,
+    /// Whether a custom title bar was detected (signals to disable native decorations).
+    pub has_custom_title_bar: bool,
+}
+
+/// A compiled custom title bar scene.
+struct TitleBarInstance {
+    scene: SceneGraph,
+    input_handler: InputHandler,
+    /// Height of the title bar in pixels.
+    height: f32,
 }
 
 /// High-level application events.
@@ -185,6 +200,10 @@ pub enum AppEvent {
     TrayAction(String),
     /// Content was swapped inside a `<page-content>` container.
     ContentSwap { page: PageId, content_id: String },
+    /// Update the window title.
+    SetTitle(String),
+    /// Window drag requested (from custom title bar).
+    WindowDragRequested,
 }
 
 impl AppHost {
@@ -212,6 +231,9 @@ impl AppHost {
             canvas_texture_slots: HashMap::new(),
             node_canvas_map: HashMap::new(),
             next_canvas_slot: 10000,
+            debug_server: DebugServer::new(),
+            title_bar: None,
+            has_custom_title_bar: false,
         }
     }
 
@@ -234,6 +256,47 @@ impl AppHost {
     pub fn set_capabilities(&mut self, caps: CapabilitySet) {
         self.devtools.has_network = caps.has_network();
         self.capabilities = caps;
+    }
+
+    /// Load a custom title bar from a `title-bar.html` file.
+    /// If the file exists and compiles successfully, the title bar is stored
+    /// and `has_custom_title_bar` is set to `true` — the consuming app should
+    /// disable native window decorations.
+    pub fn load_title_bar(&mut self, base_dir: &Path) {
+        let title_bar_path = base_dir.join("title-bar.html");
+        if !title_bar_path.exists() {
+            return;
+        }
+
+        log::info!("AppHost: loading custom title bar from {}", title_bar_path.display());
+
+        match load_html_document_full(&title_bar_path, "title-bar") {
+            Ok((doc, _scripts, _rules)) => {
+                // Default title bar height: use the root node's height if set, else 32px.
+                let height = match doc.nodes.first() {
+                    Some(root) => match root.style.height {
+                        crate::cxrd::value::Dimension::Px(h) => h,
+                        _ => 32.0,
+                    },
+                    None => 32.0,
+                };
+
+                self.title_bar = Some(TitleBarInstance {
+                    scene: SceneGraph::new(doc),
+                    input_handler: InputHandler::new(),
+                    height,
+                });
+                self.has_custom_title_bar = true;
+            }
+            Err(e) => {
+                log::error!("AppHost: failed to load title-bar.html: {}", e);
+            }
+        }
+    }
+
+    /// Get the title bar height (0.0 if no custom title bar).
+    pub fn title_bar_height(&self) -> f32 {
+        self.title_bar.as_ref().map_or(0.0, |tb| tb.height)
     }
 
     /// Get a reference to the shared data store.
@@ -387,9 +450,51 @@ impl AppHost {
             }
         }
 
+        // Route events in the title bar area to the title bar input handler.
+        if self.title_bar.is_some() {
+            let in_title_bar = match &event {
+                RawInputEvent::MouseMove { y, .. }
+                | RawInputEvent::MouseDown { y, .. }
+                | RawInputEvent::MouseUp { y, .. } => *y < self.title_bar.as_ref().unwrap().height,
+                RawInputEvent::MouseWheel { y, .. } => *y < self.title_bar.as_ref().unwrap().height,
+                _ => false,
+            };
+
+            if in_title_bar {
+                let tb = self.title_bar.as_mut().unwrap();
+                let ui_events = tb.input_handler.process_event(&mut tb.scene.document, event);
+                for ui_event in ui_events {
+                    match ui_event {
+                        UiEvent::Action(ref action) => {
+                            use crate::cxrd::node::EventAction;
+                            match action {
+                                EventAction::WindowClose => {
+                                    self.pending_events.push(AppEvent::CloseRequested);
+                                }
+                                EventAction::WindowMinimize => {
+                                    self.pending_events.push(AppEvent::MinimizeRequested);
+                                }
+                                EventAction::WindowMaximize => {
+                                    self.pending_events.push(AppEvent::MaximizeToggleRequested);
+                                }
+                                EventAction::WindowDrag => {
+                                    self.pending_events.push(AppEvent::WindowDragRequested);
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+        }
+
         // Route event to active page's input handler.
+        let is_mouse_move = matches!(event, RawInputEvent::MouseMove { .. });
         if let Some(ref page_id) = self.active_page.clone() {
             if let Some(page) = self.pages.get_mut(page_id) {
+                let prev_hovered = page.input_handler.hovered;
                 let ui_events = page.input_handler.process_event(&mut page.scene.document, event);
                 let mut click_node_ids: Vec<u32> = Vec::new();
 
@@ -428,6 +533,24 @@ impl AppHost {
                         UiEvent::Click { node_id } => {
                             click_node_ids.push(node_id);
                         }
+                        UiEvent::Action(ref action) => {
+                            use crate::cxrd::node::EventAction;
+                            match action {
+                                EventAction::WindowClose => {
+                                    self.pending_events.push(AppEvent::CloseRequested);
+                                }
+                                EventAction::WindowMinimize => {
+                                    self.pending_events.push(AppEvent::MinimizeRequested);
+                                }
+                                EventAction::WindowMaximize => {
+                                    self.pending_events.push(AppEvent::MaximizeToggleRequested);
+                                }
+                                EventAction::WindowDrag => {
+                                    self.pending_events.push(AppEvent::WindowDragRequested);
+                                }
+                                _ => {}
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -440,6 +563,12 @@ impl AppHost {
                         }
                     }
                     page.scene.invalidate_layout();
+                }
+
+                // If hover target changed and any involved node has hover_style,
+                // repaint so the hover overrides are applied visually.
+                if is_mouse_move && page.input_handler.hovered != prev_hovered {
+                    page.scene.invalidate_paint();
                 }
             }
         }
@@ -458,6 +587,9 @@ impl AppHost {
             match action {
                 ContextAction::ToggleDevTools => {
                     self.devtools.toggle();
+                }
+                ContextAction::DebugServer => {
+                    self.toggle_debug_server();
                 }
                 ContextAction::Reload => {
                     self.reload_active_page();
@@ -505,13 +637,14 @@ impl AppHost {
                 self.devtools.console.log(log_level, msg);
             }
 
-            // If JS modified the DOM, sync document back to scene.
+            // If JS modified the DOM, merge changes into the scene document
+            // without clobbering runtime state (hovered, layout, etc.).
             if js_rt.take_layout_dirty() {
                 if let Some(ref page_id) = self.active_page {
                     if let Some(page) = self.pages.get_mut(page_id) {
-                        let new_doc = js_rt.document();
-                        page.scene.load_document(new_doc.clone());
-                        drop(new_doc);
+                        let js_doc = js_rt.document();
+                        page.scene.merge_js_document(&js_doc);
+                        drop(js_doc);
                     }
                 }
             }
@@ -535,6 +668,11 @@ impl AppHost {
 
                 let _ = page.scene.tick(content_width, viewport_height, dt, font_system);
             }
+        }
+
+        // Tick custom title bar if present.
+        if let Some(ref mut tb) = self.title_bar {
+            let _ = tb.scene.tick(viewport_width, tb.height, dt, font_system);
         }
 
         // Drain pending events.
@@ -582,6 +720,11 @@ impl AppHost {
     pub fn active_scene_mut(&mut self) -> Option<&mut SceneGraph> {
         let page_id = self.active_page.clone()?;
         self.pages.get_mut(&page_id).map(|p| &mut p.scene)
+    }
+
+    /// Get the title bar scene (for rendering text areas).
+    pub fn title_bar_scene(&self) -> Option<&SceneGraph> {
+        self.title_bar.as_ref().map(|tb| &tb.scene)
     }
 
     /// Initialise the system tray icon (call once after window creation).
@@ -690,6 +833,41 @@ impl AppHost {
         self.devtools.console.entries.clear();
     }
 
+    /// Toggle the debug web server on/off and open the browser.
+    fn toggle_debug_server(&mut self) {
+        if self.debug_server.is_running() {
+            self.debug_server.stop();
+            log::info!("Debug server stopped.");
+        } else {
+            // Find the active page's HTML source path.
+            if let Some(path) = self.active_html_path() {
+                self.debug_server.update_content(&path);
+            }
+            let port = self.debug_server.start();
+            if port > 0 {
+                let url = format!("http://127.0.0.1:{}", port);
+                log::info!("Debug server started at {}", url);
+                // Open in default browser.
+                #[cfg(target_os = "windows")]
+                { let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn(); }
+                #[cfg(target_os = "macos")]
+                { let _ = std::process::Command::new("open").arg(&url).spawn(); }
+                #[cfg(target_os = "linux")]
+                { let _ = std::process::Command::new("xdg-open").arg(&url).spawn(); }
+            }
+        }
+    }
+
+    /// Get the HTML file path for the currently active page.
+    fn active_html_path(&self) -> Option<PathBuf> {
+        let page_id = self.active_page.as_ref()?;
+        let route = self.routes.iter().find(|r| &r.id == page_id)?;
+        match &route.source {
+            PageSource::HtmlFile(path) => Some(path.clone()),
+            _ => None,
+        }
+    }
+
     /// Get combined paint output: scene instances + DevTools overlay.
     /// Returns (instances, clear_color).
     pub fn combined_instances(
@@ -733,6 +911,12 @@ impl AppHost {
         // Append DevTools overlay instances.
         let devtools_instances = self.devtools.paint(&doc_for_devtools, viewport_width, viewport_height);
         let mut combined = patched;
+
+        // Prepend title bar instances (rendered on top, at y=0).
+        if let Some(ref tb) = self.title_bar {
+            combined.extend(tb.scene.cached_instances.iter().cloned());
+        }
+
         combined.extend(devtools_instances);
 
         self.devtools.draw_calls = combined.len() as u32;
@@ -864,6 +1048,13 @@ impl AppHost {
 
         page.dirty = true;
         page.scene.invalidate_layout();
+
+        // Sync the updated document into the JS runtime so that JS-driven DOM
+        // syncs (layout_dirty) don't overwrite the swapped content with a stale copy.
+        if let Some(ref js_rt) = self.js_runtime {
+            js_rt.sync_document(&page.scene.document);
+        }
+
         log::info!("AppHost: swapped page-content to '{}'", target_id);
     }
 
@@ -919,8 +1110,14 @@ impl AppHost {
             }
         };
 
-        let scene = SceneGraph::new(doc);
+        let scene = SceneGraph::new(doc.clone());
         let input_handler = InputHandler::new();
+
+        // Push title update if the document has a <title>.
+        if let Some(ref t) = doc.title {
+            self.title = t.clone();
+            self.pending_events.push(AppEvent::SetTitle(t.clone()));
+        }
 
         self.pages.insert(route.id.clone(), PageInstance {
             scene,

@@ -194,6 +194,153 @@ impl Default for FontWeight {
     }
 }
 
+/// Visibility mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Visibility {
+    Visible,
+    Hidden,
+    Collapse,
+}
+
+impl Default for Visibility {
+    fn default() -> Self { Visibility::Visible }
+}
+
+/// Pointer events mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointerEvents {
+    Auto,
+    None,
+}
+
+impl Default for PointerEvents {
+    fn default() -> Self { PointerEvents::Auto }
+}
+
+/// Text overflow mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextOverflow {
+    Clip,
+    Ellipsis,
+}
+
+impl Default for TextOverflow {
+    fn default() -> Self { TextOverflow::Clip }
+}
+
+/// Text decoration line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextDecoration {
+    None,
+    Underline,
+    LineThrough,
+    Overline,
+}
+
+impl Default for TextDecoration {
+    fn default() -> Self { TextDecoration::None }
+}
+
+/// Cursor style hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorStyle {
+    Auto,
+    Default,
+    Pointer,
+    Text,
+    Move,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    CrossHair,
+    ColResize,
+    RowResize,
+    NsResize,
+    EwResize,
+}
+
+impl Default for CursorStyle {
+    fn default() -> Self { CursorStyle::Auto }
+}
+
+/// Object-fit for images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectFit {
+    Fill,
+    Contain,
+    Cover,
+    ScaleDown,
+    None,
+}
+
+impl Default for ObjectFit {
+    fn default() -> Self { ObjectFit::Fill }
+}
+
+/// Align-content for flex/grid containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlignContent {
+    FlexStart,
+    FlexEnd,
+    Center,
+    Stretch,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+impl Default for AlignContent {
+    fn default() -> Self { AlignContent::Stretch }
+}
+
+/// Background size mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundSize {
+    Auto,
+    Cover,
+    Contain,
+}
+
+impl Default for BackgroundSize {
+    fn default() -> Self { BackgroundSize::Auto }
+}
+
+/// Background position axis value.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BackgroundPosition {
+    Px(f32),
+    Percent(f32),
+    Center,
+}
+
+impl Default for BackgroundPosition {
+    fn default() -> Self { BackgroundPosition::Percent(0.0) }
+}
+
+/// Background repeat mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundRepeat {
+    Repeat,
+    NoRepeat,
+    RepeatX,
+    RepeatY,
+}
+
+impl Default for BackgroundRepeat {
+    fn default() -> Self { BackgroundRepeat::Repeat }
+}
+
+/// Box-sizing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BoxSizing {
+    ContentBox,
+    BorderBox,
+}
+
+impl Default for BoxSizing {
+    fn default() -> Self { BoxSizing::ContentBox }
+}
+
 /// Background specification.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Background {
@@ -332,6 +479,70 @@ pub struct ComputedStyle {
 
     // --- Z-index (for stacking context) ---
     pub z_index: i32,
+
+    // --- Extended properties ---
+    /// Per-side border colors (overrides uniform border_color when set).
+    pub border_top_color: Option<Color>,
+    pub border_right_color: Option<Color>,
+    pub border_bottom_color: Option<Color>,
+    pub border_left_color: Option<Color>,
+
+    /// Per-side border widths (override uniform border_width when set).
+    pub border_top_width: Option<f32>,
+    pub border_right_width: Option<f32>,
+    pub border_bottom_width: Option<f32>,
+    pub border_left_width: Option<f32>,
+
+    /// Visibility (hidden elements take up space but aren't painted).
+    pub visibility: Visibility,
+
+    /// Pointer-events (none = click-through).
+    pub pointer_events: PointerEvents,
+
+    /// Text overflow (ellipsis truncation).
+    pub text_overflow: TextOverflow,
+
+    /// Text decoration (underline, line-through, etc.).
+    pub text_decoration: TextDecoration,
+
+    /// Cursor style hint.
+    pub cursor: CursorStyle,
+
+    /// Object-fit for images.
+    pub object_fit: ObjectFit,
+
+    /// Align-content (for flex containers with wrapped lines).
+    pub align_content: AlignContent,
+
+    /// Order for flex / grid items.
+    pub order: i32,
+
+    /// Row gap for grid / flex containers.
+    pub row_gap: f32,
+    /// Column gap for grid / flex containers.
+    pub column_gap: f32,
+
+    /// Background image URL (external reference, not asset-bundled).
+    pub background_image: Option<String>,
+    /// Background size mode.
+    pub background_size: BackgroundSize,
+    /// Background position.
+    pub background_position: (BackgroundPosition, BackgroundPosition),
+    /// Background repeat.
+    pub background_repeat: BackgroundRepeat,
+
+    /// Outline color.
+    pub outline_color: Option<Color>,
+    /// Outline width.
+    pub outline_width: f32,
+    /// Outline offset.
+    pub outline_offset: f32,
+
+    /// Aspect ratio (e.g., 16/9 → 1.777).
+    pub aspect_ratio: Option<f32>,
+
+    /// Box-sizing mode.
+    pub box_sizing: BoxSizing,
 }
 
 /// Edge insets in dimension form (before resolution to px).
@@ -399,13 +610,40 @@ impl Default for ComputedStyle {
             font_family: String::new(),
             font_size: 16.0,
             font_weight: FontWeight::default(),
-            line_height: 1.5,
+            line_height: 1.2,
             text_align: TextAlign::default(),
             letter_spacing: 0.0,
             text_transform: TextTransform::default(),
             white_space: WhiteSpace::default(),
             transitions: Vec::new(),
             z_index: 0,
+            border_top_color: None,
+            border_right_color: None,
+            border_bottom_color: None,
+            border_left_color: None,
+            border_top_width: None,
+            border_right_width: None,
+            border_bottom_width: None,
+            border_left_width: None,
+            visibility: Visibility::default(),
+            pointer_events: PointerEvents::default(),
+            text_overflow: TextOverflow::default(),
+            text_decoration: TextDecoration::default(),
+            cursor: CursorStyle::default(),
+            object_fit: ObjectFit::default(),
+            align_content: AlignContent::default(),
+            order: 0,
+            row_gap: 0.0,
+            column_gap: 0.0,
+            background_image: None,
+            background_size: BackgroundSize::default(),
+            background_position: (BackgroundPosition::default(), BackgroundPosition::default()),
+            background_repeat: BackgroundRepeat::default(),
+            outline_color: None,
+            outline_width: 0.0,
+            outline_offset: 0.0,
+            aspect_ratio: None,
+            box_sizing: BoxSizing::default(),
         }
     }
 }

@@ -9,6 +9,7 @@ pub mod overlay;
 pub mod console;
 pub mod elements;
 pub mod context_menu;
+pub mod debug_server;
 
 use crate::gpu::vertex::UiInstance;
 use crate::cxrd::document::CxrdDocument;
@@ -187,8 +188,8 @@ impl DevTools {
             y: badge_y + 3.0,
             width: overlay::BADGE_WIDTH - 16.0,
             font_size: 11.0,
-            color: Color::new(0.67, 0.68, 0.95, 1.0), // Indigo accent
-            bold: true,
+            color: Color::new(0.45, 0.45, 0.50, 0.5), // Dim subtle text
+            bold: false,
         });
 
         if self.open {

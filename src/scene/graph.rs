@@ -92,6 +92,48 @@ impl SceneGraph {
         self.gradient_cache_dirty = true;
     }
 
+    /// Merge changes from the JS runtime's document without replacing the
+    /// entire scene document.  This preserves runtime-only state (`hovered`,
+    /// `layout`, `clip`) on every node, avoiding the hover-reset bug and the
+    /// cost of a full clone + re-layout when only a handful of nodes changed.
+    pub fn merge_js_document(&mut self, js_doc: &CxrdDocument) {
+        let our = &mut self.document;
+
+        // If the node count changed (innerHTML added/removed nodes), resize.
+        if js_doc.nodes.len() > our.nodes.len() {
+            our.nodes.resize_with(js_doc.nodes.len(), || {
+                crate::cxrd::node::CxrdNode::container(0)
+            });
+        }
+
+        // Sync per-node content fields from JS while keeping runtime fields.
+        for (i, js_node) in js_doc.nodes.iter().enumerate() {
+            let node = &mut our.nodes[i];
+            // Sync DOM-authoritative fields.
+            node.id = js_node.id;
+            node.tag = js_node.tag.clone();
+            node.html_id = js_node.html_id.clone();
+            node.classes = js_node.classes.clone();
+            node.attributes = js_node.attributes.clone();
+            node.kind = js_node.kind.clone();
+            node.style = js_node.style.clone();
+            node.hover_style = js_node.hover_style.clone();
+            node.children = js_node.children.clone();
+            node.events = js_node.events.clone();
+            node.animations = js_node.animations.clone();
+            // `hovered` and `layout` are NOT overwritten — they're runtime-only.
+        }
+
+        // Sync document-level fields that JS may have changed.
+        our.free_list = js_doc.free_list.clone();
+        our.variables = js_doc.variables.clone();
+        our.background = js_doc.background;
+
+        self.layout_dirty = true;
+        self.paint_dirty = true;
+        self.data_bound_dirty = true;
+    }
+
     /// Update live data from IPC.
     pub fn update_data(&mut self, key: String, value: String) {
         self.data_values.insert(key, value);
@@ -110,6 +152,11 @@ impl SceneGraph {
     /// Mark layout as dirty (e.g. on resize, document change).
     pub fn invalidate_layout(&mut self) {
         self.layout_dirty = true;
+        self.paint_dirty = true;
+    }
+
+    /// Mark only the paint pass as dirty (e.g. on hover change).
+    pub fn invalidate_paint(&mut self) {
         self.paint_dirty = true;
     }
 

@@ -158,6 +158,8 @@ struct App {
     system_tray: Option<SystemTray>,
     /// Whether the window is currently visible (for tray hide/show).
     window_visible: bool,
+    /// Set to `true` when the app should exit at the next event-loop iteration.
+    exit_requested: bool,
 }
 
 impl App {
@@ -183,6 +185,7 @@ impl App {
             devtools: canvasx_runtime::devtools::DevTools::new(),
             system_tray: None,
             window_visible: true,
+            exit_requested: false,
         }
     }
 
@@ -369,6 +372,11 @@ impl ApplicationHandler for App {
         // Start IPC client.
         let ipc_client = IpcClient::start();
 
+        // Update window title from <title> tag if present.
+        if let Some(ref title) = doc.title {
+            window.set_title(title);
+        }
+
         // Store CSS rules and scripts for JS runtime initialization.
         self.pending_scripts = scripts;
         self.compiled_css_rules = css_rules;
@@ -490,6 +498,10 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 self.render_frame();
+                if self.exit_requested {
+                    event_loop.exit();
+                    return;
+                }
                 // Request next frame immediately.
                 if let Some(ref w) = self.window {
                     w.request_redraw();
@@ -634,6 +646,16 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Ensure redraws continue even when window is hidden (for tray event polling).
+        if let Some(ref w) = self.window {
+            w.request_redraw();
+        }
+        if self.exit_requested {
+            event_loop.exit();
+        }
+    }
 }
 
 impl App {
@@ -642,6 +664,9 @@ impl App {
         match action {
             ContextAction::ToggleDevTools => {
                 self.devtools.toggle();
+            }
+            ContextAction::DebugServer => {
+                log::info!("Debug server not available in single-scene mode.");
             }
             ContextAction::Reload => {
                 self.reload_scene();
@@ -660,6 +685,14 @@ impl App {
                 if let Some(ref mut scene) = self.scene {
                     scene.load_document(doc.clone());
                 }
+
+                // Update window title on reload.
+                if let Some(ref title) = doc.title {
+                    if let Some(ref w) = self.window {
+                        w.set_title(title);
+                    }
+                }
+
                 // Re-initialize JS runtime with the newly compiled document.
                 let css_variables: std::collections::HashMap<String, String> =
                     doc.variables.iter().cloned().collect();
@@ -733,6 +766,32 @@ impl App {
                 canvasx_runtime::scene::input_handler::UiEvent::Click { node_id } => {
                     click_node_ids.push(node_id);
                 }
+                canvasx_runtime::scene::input_handler::UiEvent::Action(ref action) => {
+                    use canvasx_runtime::cxrd::node::EventAction;
+                    match action {
+                        EventAction::WindowClose => {
+                            self.exit_requested = true;
+                        }
+                        EventAction::WindowMinimize => {
+                            if let Some(ref w) = self.window {
+                                w.set_minimized(true);
+                            }
+                        }
+                        EventAction::WindowMaximize => {
+                            if let Some(ref w) = self.window {
+                                w.set_maximized(!w.is_maximized());
+                            }
+                        }
+                        EventAction::WindowDrag => {
+                            if let Some(ref w) = self.window {
+                                let _ = w.drag_window();
+                            }
+                        }
+                        _ => {
+                            log::debug!("UI event action: {:?}", action);
+                        }
+                    }
+                }
                 other => {
                     log::debug!("UI event: {:?}", other);
                 }
@@ -805,7 +864,7 @@ impl App {
                         }
                     }
                     TrayEvent::Exit => {
-                        std::process::exit(0);
+                        self.exit_requested = true;
                     }
                     TrayEvent::Reload => {
                         self.reload_scene();
@@ -848,13 +907,13 @@ impl App {
                 self.devtools.console.log(log_level, msg);
             }
 
-            // If JS modified the DOM, sync document back to scene.
+            // If JS modified the DOM, merge changes into the scene document
+            // without clobbering runtime state (hovered, layout, etc.).
             if js_rt.take_layout_dirty() {
                 if let Some(ref mut scene) = self.scene {
-                    // Borrow document directly instead of clone to avoid allocation.
-                    let new_doc = js_rt.document();
-                    scene.load_document(new_doc.clone());
-                    drop(new_doc);
+                    let js_doc = js_rt.document();
+                    scene.merge_js_document(&js_doc);
+                    drop(js_doc);
                 }
             }
         }

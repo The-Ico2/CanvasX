@@ -258,6 +258,33 @@ fn extract_redirect(html: &str) -> Option<String> {
     None
 }
 
+/// Extract the document title from `<title>…</title>` tags.
+/// If multiple `<title>` tags exist, the last one wins.
+fn extract_title(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let mut title: Option<String> = None;
+    let mut search_start = 0;
+    while let Some(open) = lower[search_start..].find("<title") {
+        let abs_open = search_start + open;
+        if let Some(gt) = lower[abs_open..].find('>') {
+            let content_start = abs_open + gt + 1;
+            if let Some(close) = lower[content_start..].find("</title>") {
+                let content_end = content_start + close;
+                let t = html[content_start..content_end].trim();
+                if !t.is_empty() {
+                    title = Some(t.to_string());
+                }
+                search_start = content_end + "</title>".len();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    title
+}
+
 /// Extract a named attribute value from a tag string.
 fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
     let lower = tag.to_lowercase();
@@ -282,6 +309,26 @@ fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
 
 /// Compile an HTML file + CSS into a CXRD document.
 ///
+/// Flatten HTML for debug serving: resolve includes, page-content, extract inline CSS.
+/// Returns (flattened_html, combined_css).
+pub fn flatten_html_for_debug(
+    html_source: &str,
+    css_source: &str,
+    base_dir: Option<&Path>,
+) -> (String, String) {
+    let html = preprocess_includes(html_source, base_dir, 0);
+    let html = preprocess_page_content(&html, base_dir);
+    let inline_css = extract_inline_styles(&html);
+    let combined_css = if inline_css.is_empty() {
+        css_source.to_string()
+    } else if css_source.is_empty() {
+        inline_css
+    } else {
+        format!("{}\n{}", css_source, inline_css)
+    };
+    (html, combined_css)
+}
+
 /// `html_source` — the HTML content.
 /// `css_source` — the CSS content (from <link> or <style>).
 /// `asset_dir` — base directory for resolving local asset paths.
@@ -301,6 +348,8 @@ pub fn compile_html(
     let html_source = preprocess_page_content(&html_source, asset_dir);
     // 0c. Extract redirect meta before tokenizer strips <meta> tags.
     doc.redirect = extract_redirect(&html_source);
+    // 0d. Extract <title> tag (last one wins).
+    doc.title = extract_title(&html_source);
     let html_source = html_source.as_str();
 
     // 1. Extract inline <style> blocks from the HTML and merge with external CSS.
@@ -940,6 +989,8 @@ fn add_node_recursive(
         events: extract_event_bindings(&parsed),
         animations: Vec::new(),
         layout: Default::default(),
+        hover_style: Vec::new(),
+        hovered: false,
     };
 
     // Keep the raw id for selector matching.
@@ -1039,6 +1090,10 @@ fn extract_event_bindings(parsed: &ParsedNode) -> Vec<EventBinding> {
                     .cloned().unwrap_or_default();
                 EventAction::ToggleClass { target: 0, class }
             }
+            "window-close" => EventAction::WindowClose,
+            "window-minimize" => EventAction::WindowMinimize,
+            "window-maximize" => EventAction::WindowMaximize,
+            "window-drag" => EventAction::WindowDrag,
             _ => {
                 // Treat the action string as an IPC command name.
                 EventAction::IpcCommand {
@@ -1205,8 +1260,19 @@ pub fn apply_rules_to_node_with_ancestors(
 ) {
     for rule in rules {
         if compound_selector_matches(&rule.compound_selectors, node, html_id, ancestors) {
-            for (prop, val) in &rule.declarations {
-                apply_property(&mut node.style, prop, val, variables);
+            if let Some(ref pseudo) = rule.pseudo_class {
+                if pseudo == "hover" {
+                    // Store declarations as hover overrides instead of applying immediately.
+                    for (prop, val) in &rule.declarations {
+                        let resolved = crate::compiler::css::resolve_var_pub(val, variables);
+                        node.hover_style.push((prop.clone(), resolved));
+                    }
+                }
+                // Other pseudo-classes (focus, active) ignored for now.
+            } else {
+                for (prop, val) in &rule.declarations {
+                    apply_property(&mut node.style, prop, val, variables);
+                }
             }
         }
     }

@@ -231,12 +231,12 @@ impl InputHandler {
 
     // --- Mouse handlers ---
 
-    fn handle_mouse_move(&mut self, doc: &CxrdDocument, x: f32, y: f32) {
+    fn handle_mouse_move(&mut self, doc: &mut CxrdDocument, x: f32, y: f32) {
         let hit = self.hit_test(doc, x, y);
 
         // Update hover state.
         if hit != self.hovered {
-            // Un-hover previous.
+            // Un-hover previous node and all its ancestors.
             if let Some(prev) = self.hovered {
                 if let Some(state) = self.states.get_mut(&prev) {
                     state.hovered = false;
@@ -246,14 +246,30 @@ impl InputHandler {
                         state.focus
                     };
                 }
+                // Clear hovered flag on the node and all ancestors.
+                let mut clear_id = Some(prev);
+                while let Some(nid) = clear_id {
+                    if let Some(node) = doc.get_node_mut(nid) {
+                        node.hovered = false;
+                    }
+                    clear_id = doc.find_parent(nid);
+                }
             }
 
-            // Hover new.
+            // Hover new node and all its ancestors.
             if let Some(node_id) = hit {
                 let state = self.states.entry(node_id).or_default();
                 state.hovered = true;
                 if state.focus == FocusState::None {
                     state.focus = FocusState::Hovered;
+                }
+                // Set hovered flag on the node and all ancestors.
+                let mut hover_id = Some(node_id);
+                while let Some(nid) = hover_id {
+                    if let Some(node) = doc.get_node_mut(nid) {
+                        node.hovered = true;
+                    }
+                    hover_id = doc.find_parent(nid);
                 }
             }
 

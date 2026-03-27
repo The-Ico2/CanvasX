@@ -608,11 +608,17 @@ fn estimate_content_width(doc: &CxrdDocument, node_id: NodeId, constraints: &Lay
 
         // Text leaf fallback.
         let font_size = cs.font_size.max(1.0);
+        // Adjust character width heuristic for font weight (bold is wider).
+        let weight_factor = if cs.font_weight.0 >= 700 { 0.62 } else if cs.font_weight.0 >= 500 { 0.58 } else { 0.54 };
         let text_width = match &node.kind {
             NodeKind::Text { content } => {
+                let char_count = content.chars().count() as f32;
                 let letters = content.chars().filter(|c| !c.is_whitespace()).count() as f32;
                 let spaces = content.chars().filter(|c| c.is_whitespace()).count() as f32;
-                letters * font_size * 0.54 + spaces * font_size * 0.28
+                let base = letters * font_size * weight_factor + spaces * font_size * 0.28;
+                // Add letter-spacing contribution (applies between every character).
+                let spacing = if char_count > 1.0 { cs.letter_spacing * char_count } else { 0.0 };
+                base + spacing
             }
             _ => 0.0,
         };

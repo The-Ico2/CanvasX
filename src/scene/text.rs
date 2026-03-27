@@ -277,14 +277,50 @@ impl TextPainter {
             };
 
             let rect = &node.layout.content_rect;
-            let color = &node.style.color;
+            let color = if node.hovered && !node.hover_style.is_empty() {
+                // Check if hover_style overrides the color.
+                let mut c = node.style.color.clone();
+                for (prop, val) in &node.hover_style {
+                    if prop == "color" {
+                        if let Some(parsed) = crate::compiler::css::parse_color(val) {
+                            c = parsed;
+                        }
+                    }
+                }
+                c
+            } else if node.hovered {
+                // Node is hovered but has no hover_style — check ancestors for
+                // inheritable color overrides (e.g. parent .nav-item:hover { color: ... }).
+                let mut c = node.style.color.clone();
+                let mut ancestor_id = doc.find_parent(*node_id);
+                while let Some(aid) = ancestor_id {
+                    if let Some(ancestor) = doc.get_node(aid) {
+                        if ancestor.hovered && !ancestor.hover_style.is_empty() {
+                            for (prop, val) in &ancestor.hover_style {
+                                if prop == "color" {
+                                    if let Some(parsed) = crate::compiler::css::parse_color(val) {
+                                        c = parsed;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    ancestor_id = doc.find_parent(aid);
+                }
+                c
+            } else {
+                node.style.color.clone()
+            };
 
             // Use floor/ceil to prevent fractional-pixel clipping at text edges.
+            // Add small buffers: +1px right (matches buffer width +1 in layout),
+            // +2px bottom for font descender overflow.
             let mut left = rect.x.floor() as i32;
             let baseline_offset = 1.0;
             let mut top = (rect.y + baseline_offset).floor() as i32;
-            let mut right = (rect.x + rect.width).ceil() as i32;
-            let mut bottom = (rect.y + rect.height).ceil() as i32;
+            let mut right = (rect.x + rect.width + 1.0).ceil() as i32;
+            let mut bottom = (rect.y + rect.height + 2.0).ceil() as i32;
 
             // Intersect with the overflow clip rect from the nearest overflow:hidden ancestor.
             if let Some(clip) = &node.layout.clip {

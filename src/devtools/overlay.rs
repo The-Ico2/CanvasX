@@ -50,21 +50,14 @@ fn make_rect_instance(
 }
 
 /// Paint the "CanvasX" badge in the bottom-left corner.
-/// The badge uses a slightly translucent dark background with an indigo border
-/// so it stays visible on both light and dark application backgrounds.
+/// Renders as dim text only — no background or border.
 pub fn paint_badge(
-    out: &mut Vec<UiInstance>,
+    _out: &mut Vec<UiInstance>,
     _viewport_width: f32,
-    viewport_height: f32,
+    _viewport_height: f32,
 ) {
-    let x = BADGE_MARGIN;
-    let y = viewport_height - BADGE_HEIGHT - BADGE_MARGIN;
-    out.push(make_rect_instance(
-        x, y, BADGE_WIDTH, BADGE_HEIGHT,
-        Color::new(0.12, 0.12, 0.18, 0.95),
-        Some(Color::new(0.39, 0.40, 0.95, 0.6)),
-        4.0,
-    ));
+    // No background or border — just a hit target for click detection.
+    // The text is rendered separately via text_entries().
 }
 
 /// Paint the full DevTools panel (tab bar + content area).

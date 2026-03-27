@@ -103,6 +103,11 @@ pub struct CxrdNode {
     /// Fully computed style (resolved from CSS at compile time).
     pub style: ComputedStyle,
 
+    /// Style property overrides for `:hover` state.
+    /// Applied at paint time when the node is hovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hover_style: Vec<(String, String)>,
+
     /// Child node IDs (indexes into the document's node list).
     pub children: Vec<NodeId>,
 
@@ -111,6 +116,10 @@ pub struct CxrdNode {
 
     /// Animation references (indexes into document Animation table).
     pub animations: Vec<u32>,
+
+    /// Whether this node is currently hovered (runtime state, not serialised).
+    #[serde(skip)]
+    pub hovered: bool,
 
     /// Layout result — populated after layout pass.
     #[serde(skip)]
@@ -160,6 +169,14 @@ pub enum EventAction {
     StartAnimation { animation_index: u32 },
     /// Set scroll position.
     ScrollTo { target: NodeId, x: f32, y: f32 },
+    /// Window control: close the window.
+    WindowClose,
+    /// Window control: minimize the window.
+    WindowMinimize,
+    /// Window control: toggle maximize state.
+    WindowMaximize,
+    /// Window control: initiate window drag.
+    WindowDrag,
 }
 
 impl CxrdNode {
@@ -177,6 +194,8 @@ impl CxrdNode {
             events: Vec::new(),
             animations: Vec::new(),
             layout: LayoutResult::default(),
+            hover_style: Vec::new(),
+            hovered: false,
         }
     }
 
@@ -194,6 +213,8 @@ impl CxrdNode {
             events: Vec::new(),
             animations: Vec::new(),
             layout: LayoutResult::default(),
+            hover_style: Vec::new(),
+            hovered: false,
         }
     }
 }

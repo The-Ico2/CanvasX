@@ -62,6 +62,10 @@ pub struct CxrdDocument {
     /// Optional redirect target (from `<meta name="redirect" content="...">`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect: Option<String>,
+
+    /// Document title extracted from `<title>` tags (last one wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Document metadata.
@@ -123,6 +127,7 @@ impl CxrdDocument {
             viewport_width: 1920.0,
             viewport_height: 1080.0,
             redirect: None,
+            title: None,
         }
     }
 

@@ -37,6 +37,7 @@ pub enum ContextMenuEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextAction {
     ToggleDevTools,
+    DebugServer,
     Reload,
     Exit,
 }
@@ -70,6 +71,11 @@ impl ContextMenu {
             ContextMenuEntry::Item {
                 label: "DevTools".to_string(),
                 action: ContextAction::ToggleDevTools,
+                enabled: true,
+            },
+            ContextMenuEntry::Item {
+                label: "Debug Server".to_string(),
+                action: ContextAction::DebugServer,
                 enabled: true,
             },
             ContextMenuEntry::Separator,

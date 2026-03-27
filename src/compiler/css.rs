@@ -19,6 +19,9 @@ pub struct CssRule {
     pub compound_selectors: Vec<CompoundSelector>,
     /// Property declarations.
     pub declarations: Vec<(String, String)>,
+    /// Pseudo-class that must be active for this rule to apply (e.g. "hover", "focus").
+    /// `None` means the rule applies unconditionally.
+    pub pseudo_class: Option<String>,
 }
 
 /// A compound CSS selector part (matches a single element).
@@ -134,11 +137,12 @@ pub fn parse_css(source: &str) -> Vec<CssRule> {
         // Handle comma-separated selectors: "html, body" → two rules.
         let selector_group: Vec<&str> = selector.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         for sel in selector_group {
-            let compound_selectors = parse_compound_selector(sel);
+            let (compound_selectors, pseudo_class) = parse_compound_selector(sel);
             rules.push(CssRule {
                 selector: sel.to_string(),
                 compound_selectors,
                 declarations: declarations.clone(),
+                pseudo_class,
             });
         }
     }
@@ -154,15 +158,20 @@ pub fn parse_css(source: &str) -> Vec<CssRule> {
 ///   ".cap.on"    → [Compound{classes:["cap","on"]}]
 ///   "#mediaPanel h2" → [Compound{id:"mediaPanel"}, Compound{tag:"h2"}]
 ///   "*"          → [Compound{universal:true}]
-fn parse_compound_selector(selector: &str) -> Vec<CompoundSelector> {
+///
+/// Returns `(compound_selectors, pseudo_class)`.  The pseudo-class (e.g. `"hover"`)
+/// is extracted from the **last** token if it contains a single colon.
+fn parse_compound_selector(selector: &str) -> (Vec<CompoundSelector>, Option<String>) {
     let mut chain = Vec::new();
+    let mut pseudo_class: Option<String> = None;
+
     for token in selector.split_whitespace() {
         // Skip pseudo-elements: we don't render them, so the entire selector
         // is unmatchable. Return empty chain (compound_selector_matches returns false).
         let token = if token.contains("::") {
-            return Vec::new();
+            return (Vec::new(), None);
         } else if let Some(idx) = token.find(':') {
-            // :root, :hover, etc. — keep the part before for matching
+            let pseudo = &token[idx + 1..];
             let before = &token[..idx];
             if before.is_empty() {
                 // Pure pseudo like ":root"
@@ -174,6 +183,8 @@ fn parse_compound_selector(selector: &str) -> Vec<CompoundSelector> {
                 });
                 continue;
             }
+            // Record the pseudo-class (hover, focus, active, etc.)
+            pseudo_class = Some(pseudo.to_lowercase());
             before
         } else {
             token
@@ -234,7 +245,7 @@ fn parse_compound_selector(selector: &str) -> Vec<CompoundSelector> {
 
         chain.push(compound);
     }
-    chain
+    (chain, pseudo_class)
 }
 
 /// Parse a CSS selector into parts (legacy, kept for backward compat).
@@ -695,10 +706,364 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
             };
         }
 
-        "cursor" | "text-decoration" | "text-decoration-line" | "font-variant-numeric"
-        | "font-variant" | "list-style" | "list-style-type" | "outline" | "outline-style"
-        | "appearance" => {
-            // Silently ignore properties that don't affect layout or rendering.
+        // --- Per-side border shorthand ---
+        "border-top" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if let Some(width) = parts.first().and_then(|v| parse_px(v)) {
+                style.border_top_width = Some(width);
+            }
+            let color_start = value.find("rgba(")
+                .or_else(|| value.find("rgb("))
+                .or_else(|| value.find('#'));
+            if let Some(start) = color_start {
+                if let Some(c) = parse_color(&value[start..]) {
+                    style.border_top_color = Some(c);
+                }
+            } else if let Some(color) = parts.last().and_then(|v| parse_color(v)) {
+                style.border_top_color = Some(color);
+            }
+        }
+        "border-right" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if let Some(width) = parts.first().and_then(|v| parse_px(v)) {
+                style.border_right_width = Some(width);
+            }
+            let color_start = value.find("rgba(")
+                .or_else(|| value.find("rgb("))
+                .or_else(|| value.find('#'));
+            if let Some(start) = color_start {
+                if let Some(c) = parse_color(&value[start..]) {
+                    style.border_right_color = Some(c);
+                }
+            } else if let Some(color) = parts.last().and_then(|v| parse_color(v)) {
+                style.border_right_color = Some(color);
+            }
+        }
+        "border-bottom" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if let Some(width) = parts.first().and_then(|v| parse_px(v)) {
+                style.border_bottom_width = Some(width);
+            }
+            let color_start = value.find("rgba(")
+                .or_else(|| value.find("rgb("))
+                .or_else(|| value.find('#'));
+            if let Some(start) = color_start {
+                if let Some(c) = parse_color(&value[start..]) {
+                    style.border_bottom_color = Some(c);
+                }
+            } else if let Some(color) = parts.last().and_then(|v| parse_color(v)) {
+                style.border_bottom_color = Some(color);
+            }
+        }
+        "border-left" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if let Some(width) = parts.first().and_then(|v| parse_px(v)) {
+                style.border_left_width = Some(width);
+            }
+            let color_start = value.find("rgba(")
+                .or_else(|| value.find("rgb("))
+                .or_else(|| value.find('#'));
+            if let Some(start) = color_start {
+                if let Some(c) = parse_color(&value[start..]) {
+                    style.border_left_color = Some(c);
+                }
+            } else if let Some(color) = parts.last().and_then(|v| parse_color(v)) {
+                style.border_left_color = Some(color);
+            }
+        }
+
+        // Per-side border widths
+        "border-top-width" => {
+            if let Some(w) = parse_px(value) { style.border_top_width = Some(w); }
+        }
+        "border-right-width" => {
+            if let Some(w) = parse_px(value) { style.border_right_width = Some(w); }
+        }
+        "border-bottom-width" => {
+            if let Some(w) = parse_px(value) { style.border_bottom_width = Some(w); }
+        }
+        "border-left-width" => {
+            if let Some(w) = parse_px(value) { style.border_left_width = Some(w); }
+        }
+
+        // Per-side border colors
+        "border-top-color" => {
+            if let Some(c) = parse_color(value) { style.border_top_color = Some(c); }
+        }
+        "border-right-color" => {
+            if let Some(c) = parse_color(value) { style.border_right_color = Some(c); }
+        }
+        "border-bottom-color" => {
+            if let Some(c) = parse_color(value) { style.border_bottom_color = Some(c); }
+        }
+        "border-left-color" => {
+            if let Some(c) = parse_color(value) { style.border_left_color = Some(c); }
+        }
+
+        // Per-side border radius
+        "border-top-left-radius" => {
+            if let Some(v) = parse_px(value) { style.border_radius.top_left = v; }
+        }
+        "border-top-right-radius" => {
+            if let Some(v) = parse_px(value) { style.border_radius.top_right = v; }
+        }
+        "border-bottom-right-radius" => {
+            if let Some(v) = parse_px(value) { style.border_radius.bottom_right = v; }
+        }
+        "border-bottom-left-radius" => {
+            if let Some(v) = parse_px(value) { style.border_radius.bottom_left = v; }
+        }
+
+        // --- Visibility ---
+        "visibility" => {
+            use crate::cxrd::style::Visibility;
+            style.visibility = match value {
+                "visible" => Visibility::Visible,
+                "hidden" => Visibility::Hidden,
+                "collapse" => Visibility::Collapse,
+                _ => style.visibility,
+            };
+        }
+
+        // --- Pointer events ---
+        "pointer-events" => {
+            use crate::cxrd::style::PointerEvents;
+            style.pointer_events = match value {
+                "auto" | "all" => PointerEvents::Auto,
+                "none" => PointerEvents::None,
+                _ => style.pointer_events,
+            };
+        }
+
+        // --- Text overflow ---
+        "text-overflow" => {
+            use crate::cxrd::style::TextOverflow;
+            style.text_overflow = match value {
+                "clip" => TextOverflow::Clip,
+                "ellipsis" => TextOverflow::Ellipsis,
+                _ => style.text_overflow,
+            };
+        }
+
+        // --- Text decoration ---
+        "text-decoration" | "text-decoration-line" => {
+            use crate::cxrd::style::TextDecoration;
+            style.text_decoration = match value {
+                "none" => TextDecoration::None,
+                "underline" => TextDecoration::Underline,
+                "line-through" => TextDecoration::LineThrough,
+                "overline" => TextDecoration::Overline,
+                _ => style.text_decoration,
+            };
+        }
+
+        // --- Cursor ---
+        "cursor" => {
+            use crate::cxrd::style::CursorStyle;
+            style.cursor = match value {
+                "auto" => CursorStyle::Auto,
+                "default" => CursorStyle::Default,
+                "pointer" => CursorStyle::Pointer,
+                "text" => CursorStyle::Text,
+                "move" => CursorStyle::Move,
+                "not-allowed" => CursorStyle::NotAllowed,
+                "grab" => CursorStyle::Grab,
+                "grabbing" => CursorStyle::Grabbing,
+                "crosshair" => CursorStyle::CrossHair,
+                "col-resize" => CursorStyle::ColResize,
+                "row-resize" => CursorStyle::RowResize,
+                "ns-resize" | "n-resize" | "s-resize" => CursorStyle::NsResize,
+                "ew-resize" | "e-resize" | "w-resize" => CursorStyle::EwResize,
+                _ => style.cursor,
+            };
+        }
+
+        // --- Object-fit ---
+        "object-fit" => {
+            use crate::cxrd::style::ObjectFit;
+            style.object_fit = match value {
+                "fill" => ObjectFit::Fill,
+                "contain" => ObjectFit::Contain,
+                "cover" => ObjectFit::Cover,
+                "scale-down" => ObjectFit::ScaleDown,
+                "none" => ObjectFit::None,
+                _ => style.object_fit,
+            };
+        }
+
+        // --- Align-content ---
+        "align-content" => {
+            use crate::cxrd::style::AlignContent;
+            style.align_content = match value {
+                "flex-start" | "start" => AlignContent::FlexStart,
+                "flex-end" | "end" => AlignContent::FlexEnd,
+                "center" => AlignContent::Center,
+                "stretch" => AlignContent::Stretch,
+                "space-between" => AlignContent::SpaceBetween,
+                "space-around" => AlignContent::SpaceAround,
+                "space-evenly" => AlignContent::SpaceEvenly,
+                _ => style.align_content,
+            };
+        }
+
+        // --- Order ---
+        "order" => {
+            if let Ok(v) = value.parse::<i32>() {
+                style.order = v;
+            }
+        }
+
+        // --- Row / Column gap ---
+        "row-gap" => {
+            if let Some(v) = parse_px(value) { style.row_gap = v; }
+        }
+        "column-gap" => {
+            if let Some(v) = parse_px(value) { style.column_gap = v; }
+        }
+
+        // --- Background image / size / position / repeat ---
+        "background-image" => {
+            // url(...) → store as string reference
+            if let Some(start) = value.find("url(") {
+                let rest = &value[start + 4..];
+                let url = rest.trim_start_matches(|c: char| c == '\'' || c == '"');
+                let end = url.find(|c: char| c == '\'' || c == '"' || c == ')').unwrap_or(url.len());
+                style.background_image = Some(url[..end].to_string());
+            }
+        }
+        "background-size" => {
+            use crate::cxrd::style::BackgroundSize;
+            style.background_size = match value {
+                "cover" => BackgroundSize::Cover,
+                "contain" => BackgroundSize::Contain,
+                "auto" => BackgroundSize::Auto,
+                _ => style.background_size,
+            };
+        }
+        "background-position" => {
+            use crate::cxrd::style::BackgroundPosition;
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let parse_pos = |s: &str| -> BackgroundPosition {
+                if s == "center" { BackgroundPosition::Center }
+                else if s == "left" || s == "top" { BackgroundPosition::Percent(0.0) }
+                else if s == "right" || s == "bottom" { BackgroundPosition::Percent(100.0) }
+                else if let Some(p) = s.strip_suffix('%') {
+                    BackgroundPosition::Percent(p.parse().unwrap_or(0.0))
+                } else if let Some(v) = parse_px(s) {
+                    BackgroundPosition::Px(v)
+                } else {
+                    BackgroundPosition::Percent(0.0)
+                }
+            };
+            match parts.len() {
+                1 => {
+                    let p = parse_pos(parts[0]);
+                    style.background_position = (p, BackgroundPosition::Center);
+                }
+                2 => {
+                    style.background_position = (parse_pos(parts[0]), parse_pos(parts[1]));
+                }
+                _ => {}
+            }
+        }
+        "background-repeat" => {
+            use crate::cxrd::style::BackgroundRepeat;
+            style.background_repeat = match value {
+                "repeat" => BackgroundRepeat::Repeat,
+                "no-repeat" => BackgroundRepeat::NoRepeat,
+                "repeat-x" => BackgroundRepeat::RepeatX,
+                "repeat-y" => BackgroundRepeat::RepeatY,
+                _ => style.background_repeat,
+            };
+        }
+
+        // --- Outline ---
+        "outline" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if let Some(width) = parts.first().and_then(|v| parse_px(v)) {
+                style.outline_width = width;
+            }
+            let color_start = value.find("rgba(")
+                .or_else(|| value.find("rgb("))
+                .or_else(|| value.find('#'));
+            if let Some(start) = color_start {
+                if let Some(c) = parse_color(&value[start..]) {
+                    style.outline_color = Some(c);
+                }
+            } else if let Some(color) = parts.last().and_then(|v| parse_color(v)) {
+                style.outline_color = Some(color);
+            }
+        }
+        "outline-color" => {
+            if let Some(c) = parse_color(value) { style.outline_color = Some(c); }
+        }
+        "outline-width" => {
+            if let Some(w) = parse_px(value) { style.outline_width = w; }
+        }
+        "outline-offset" => {
+            if let Some(v) = parse_px(value) { style.outline_offset = v; }
+        }
+        "outline-style" => {
+            // Stored as outline_width > 0 implies styled; ignore "none".
+            if value == "none" { style.outline_width = 0.0; }
+        }
+
+        // --- Aspect ratio ---
+        "aspect-ratio" => {
+            if value == "auto" {
+                style.aspect_ratio = None;
+            } else if let Some(slash) = value.find('/') {
+                let w: f32 = value[..slash].trim().parse().unwrap_or(1.0);
+                let h: f32 = value[slash+1..].trim().parse().unwrap_or(1.0);
+                if h > 0.0 { style.aspect_ratio = Some(w / h); }
+            } else if let Ok(v) = value.parse::<f32>() {
+                style.aspect_ratio = Some(v);
+            }
+        }
+
+        // --- Box-sizing ---
+        "box-sizing" => {
+            use crate::cxrd::style::BoxSizing;
+            style.box_sizing = match value {
+                "content-box" => BoxSizing::ContentBox,
+                "border-box" => BoxSizing::BorderBox,
+                _ => style.box_sizing,
+            };
+        }
+
+        // --- Silently ignored properties ---
+        "font-variant-numeric" | "font-variant" | "list-style" | "list-style-type"
+        | "appearance" | "font-style" | "font-feature-settings" | "font-optical-sizing"
+        | "-webkit-font-smoothing" | "-moz-osx-font-smoothing" | "text-rendering"
+        | "text-size-adjust" | "-webkit-text-size-adjust" | "word-break" | "word-wrap"
+        | "overflow-wrap" | "hyphens" | "tab-size"
+        | "text-indent" | "text-shadow" | "text-underline-offset" | "text-decoration-color"
+        | "text-decoration-thickness" | "text-decoration-style"
+        | "border-style" | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style"
+        | "border-collapse" | "border-spacing" | "border-image"
+        | "will-change" | "contain" | "content-visibility" | "isolation"
+        | "mix-blend-mode" | "filter" | "clip-path" | "clip"
+        | "resize" | "user-select" | "-webkit-user-select"
+        | "scroll-behavior" | "scroll-snap-type" | "scroll-snap-align"
+        | "scroll-margin" | "scroll-padding"
+        | "animation" | "animation-name" | "animation-duration" | "animation-timing-function"
+        | "animation-delay" | "animation-iteration-count" | "animation-direction"
+        | "animation-fill-mode" | "animation-play-state"
+        | "transition-property" | "transition-duration" | "transition-timing-function" | "transition-delay"
+        | "all" | "unset" | "initial" | "inherit" | "revert"
+        | "content" | "counter-reset" | "counter-increment"
+        | "quotes" | "orphans" | "widows" | "page-break-before" | "page-break-after" | "page-break-inside"
+        | "break-before" | "break-after" | "break-inside"
+        | "columns" | "column-count" | "column-width" | "column-rule" | "column-fill" | "column-span"
+        | "table-layout" | "caption-side" | "empty-cells"
+        | "vertical-align" | "unicode-bidi" | "direction"
+        | "touch-action" | "overscroll-behavior" | "-webkit-overflow-scrolling"
+        | "backface-visibility" | "perspective" | "perspective-origin" | "transform-origin" | "transform-style"
+        | "place-items" | "place-content" | "place-self"
+        | "grid-area" | "grid-template-areas" | "grid-template" | "grid-auto-flow" | "grid-auto-columns" | "grid-auto-rows"
+        | "grid-gap"
+        => {
+            // Silently ignore properties not yet implemented or that don't affect layout/rendering.
         }
 
         _ => {

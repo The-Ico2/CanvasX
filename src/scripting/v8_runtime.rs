@@ -448,6 +448,13 @@ impl JsRuntime {
         std::cell::Ref::map(self.state.borrow(), |s| &s.document)
     }
 
+    /// Replace the JS runtime's document with an updated copy.
+    /// Used after content swaps so that JS-driven DOM syncs don't overwrite
+    /// the newly swapped content with a stale snapshot.
+    pub fn sync_document(&self, doc: &CxrdDocument) {
+        self.state.borrow_mut().document = doc.clone();
+    }
+
     /// Get a mutable reference to the shared state.
     pub fn state_mut(&self) -> std::cell::RefMut<'_, SharedState> {
         self.state.borrow_mut()
