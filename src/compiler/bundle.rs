@@ -137,9 +137,11 @@ pub fn load_image_asset(doc: &mut CxrdDocument, path: &Path) -> Result<u32> {
 }
 
 /// Resolve `<img src="...">` nodes: match `src` attribute against the asset
-/// path→index map and update `NodeKind::Image { asset_index }`.
+/// path→index map and update `NodeKind::Image { asset_index }` and
+/// `style.background` so the paint system renders the texture.
 pub fn resolve_image_nodes(doc: &mut CxrdDocument, path_to_index: &std::collections::HashMap<String, u32>) {
     use crate::cxrd::node::NodeKind;
+    use crate::cxrd::style::Background;
     for node in &mut doc.nodes {
         if let NodeKind::Image { ref mut asset_index, .. } = node.kind {
             if let Some(src) = node.attributes.get("src") {
@@ -149,6 +151,8 @@ pub fn resolve_image_nodes(doc: &mut CxrdDocument, path_to_index: &std::collecti
                     .or_else(|| path_to_index.get(src.as_str()))
                 {
                     *asset_index = idx;
+                    // Wire into style.background so paint_node emits a textured quad.
+                    node.style.background = Background::Image { asset_index: idx };
                 }
             }
         }

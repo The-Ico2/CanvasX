@@ -74,6 +74,20 @@ impl AssetBundle {
         idx
     }
 
+    /// Add pre-rasterized RGBA pixels as an image asset. The data is stored with
+    /// mime "image/raw-rgba" so the renderer knows to upload directly without decoding.
+    pub fn add_raw_image(&mut self, name: String, width: u32, height: u32, rgba: Vec<u8>) -> u32 {
+        let idx = self.images.len() as u32;
+        self.images.push(ImageAsset {
+            name,
+            mime: "image/raw-rgba".to_string(),
+            data: rgba,
+            width,
+            height,
+        });
+        idx
+    }
+
     /// Add a font asset, returning its index.
     pub fn add_font(&mut self, family: String, weight: u16, italic: bool, data: Vec<u8>) -> u32 {
         let idx = self.fonts.len() as u32;

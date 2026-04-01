@@ -96,6 +96,15 @@ impl Color {
         [self.r, self.g, self.b, self.a]
     }
 
+    /// Convert to a `#rrggbb` hex string (ignores alpha).
+    pub fn to_hex_string(&self) -> String {
+        format!("#{:02x}{:02x}{:02x}",
+            (self.r * 255.0).round() as u8,
+            (self.g * 255.0).round() as u8,
+            (self.b * 255.0).round() as u8,
+        )
+    }
+
     /// Linear interpolation between two colors.
     pub fn lerp(&self, other: &Color, t: f32) -> Color {
         Color {

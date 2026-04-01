@@ -1,601 +1,624 @@
 // openrender-runtime/src/compiler/css/parsing.rs
 //
-// Shared CSS value parsing utilities used across all CSS versions.
-// Contains parsers for dimensions, colors, gradients, grid tracks,
-// calc() expressions, box-shadow, and CSS variable resolution.
+// Shared CSS value parsers — dimensions, colors, gradients, shadows, etc.
+// Used by the property application logic in css.rs and by html.rs / v8_runtime.rs
+// through the re-exports in mod.rs.
 
 use crate::cxrd::style::*;
 use crate::cxrd::value::{Color, Dimension};
 use std::collections::HashMap;
 
-// ───────────────────────────── Dimension parsing ─────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  CSS VARIABLE RESOLUTION
+// ═════════════════════════════════════════════════════════════════════════════
 
-/// Parse a CSS dimension value.
-pub fn parse_dimension(value: &str) -> Dimension {
-    let value = value.trim();
-    if value == "auto" {
-        return Dimension::Auto;
-    }
-
-    // Handle calc() expressions.
-    if value.starts_with("calc(") {
-        if let Some(inner) = value.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
-            return parse_calc_dimension(inner);
-        }
-    }
-
-    if let Some(v) = value.strip_suffix("px") {
-        if let Ok(n) = v.trim().parse::<f32>() {
-            return Dimension::Px(n);
-        }
-    }
-    if let Some(v) = value.strip_suffix('%') {
-        if let Ok(n) = v.trim().parse::<f32>() {
-            return Dimension::Percent(n);
-        }
-    }
-    if let Some(v) = value.strip_suffix("rem") {
-        if let Ok(n) = v.trim().parse::<f32>() {
-            return Dimension::Rem(n);
-        }
-    }
-    if let Some(v) = value.strip_suffix("em") {
-        if let Ok(n) = v.trim().parse::<f32>() {
-            return Dimension::Em(n);
-        }
-    }
-    if let Some(v) = value.strip_suffix("vw") {
-        if let Ok(n) = v.trim().parse::<f32>() {
-            return Dimension::Vw(n);
-        }
-    }
-    if let Some(v) = value.strip_suffix("vh") {
-        if let Ok(n) = v.trim().parse::<f32>() {
-            return Dimension::Vh(n);
-        }
-    }
-    // Bare number → px
-    if let Ok(n) = value.parse::<f32>() {
-        return Dimension::Px(n);
-    }
-    Dimension::Auto
-}
-
-/// Parse a `calc()` expression into a Dimension.
-///
-/// Handles common patterns:
-///   - `calc(100% / N)` → Percent(100/N)
-///   - `calc(100% - Npx)` → Percent(100) (approximate — drops px term)
-///   - `calc(Npx + Mpx)` → Px(N+M)
-///   - `calc(Npx * N)` → Px(result)
-///
-/// Falls back to evaluating as a pure numeric expression when possible.
-pub(crate) fn parse_calc_dimension(expr: &str) -> Dimension {
-    let expr = expr.trim();
-
-    // Try to detect the "dominant" unit in the expression.
-    if expr.contains('%') {
-        let parts: Vec<&str> = expr.split_whitespace().collect();
-        if let Some(pct_pos) = parts.iter().position(|p| p.ends_with('%')) {
-            let pct_val = parts[pct_pos].trim_end_matches('%').parse::<f32>().unwrap_or(100.0);
-
-            if pct_pos + 2 < parts.len() {
-                let op = parts[pct_pos + 1];
-                let rhs_str = parts[pct_pos + 2].trim_end_matches("px");
-                let rhs = eval_calc_expr(rhs_str).unwrap_or(1.0);
-                match op {
-                    "/" => return Dimension::Percent(pct_val / rhs),
-                    "*" => return Dimension::Percent(pct_val * rhs),
-                    "+" | "-" => {
-                        return Dimension::Percent(pct_val);
+/// Resolve CSS custom property references: `var(--name)` → value.
+/// Handles nested `var()` and fallback values `var(--name, fallback)`.
+pub fn resolve_var(value: &str, variables: &HashMap<String, String>) -> String {
+    let mut result = value.to_string();
+    let mut iterations = 0;
+    while result.contains("var(") && iterations < 20 {
+        iterations += 1;
+        if let Some(start) = result.find("var(") {
+            let rest = &result[start + 4..];
+            // Find the matching closing paren, respecting nesting.
+            let mut depth = 1;
+            let mut end = 0;
+            for (i, ch) in rest.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
                     }
                     _ => {}
                 }
             }
-            return Dimension::Percent(pct_val);
+            let inner = &rest[..end];
+            let (var_name, fallback) = if let Some(comma) = inner.find(',') {
+                (inner[..comma].trim(), Some(inner[comma + 1..].trim()))
+            } else {
+                (inner.trim(), None)
+            };
+            let resolved = variables
+                .get(var_name)
+                .cloned()
+                .or_else(|| fallback.map(|f| f.to_string()))
+                .unwrap_or_default();
+            result = format!("{}{}{}", &result[..start], resolved, &rest[end + 1..]);
         }
     }
-
-    // Pure px or unitless arithmetic.
-    let cleaned = expr.replace("px", "");
-    if let Some(result) = eval_calc_expr(&cleaned) {
-        return Dimension::Px(result);
-    }
-
-    Dimension::Auto
+    result
 }
 
-/// Evaluate a simple arithmetic expression (supports +, -, *, /).
-/// Handles operator precedence: * and / before + and -.
-pub(crate) fn eval_calc_expr(expr: &str) -> Option<f32> {
-    let expr = expr.trim();
-
-    let mut tokens: Vec<CalcToken> = Vec::new();
-    let mut pos = 0;
-    let bytes = expr.as_bytes();
-
-    while pos < bytes.len() {
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos >= bytes.len() { break; }
-
-        if matches!(bytes[pos], b'+' | b'*' | b'/') {
-            tokens.push(CalcToken::Op(bytes[pos] as char));
-            pos += 1;
-            continue;
-        }
-
-        if bytes[pos] == b'-' {
-            let is_neg = tokens.is_empty() || matches!(tokens.last(), Some(CalcToken::Op(_)));
-            if !is_neg {
-                tokens.push(CalcToken::Op('-'));
-                pos += 1;
-                continue;
-            }
-        }
-
-        let num_start = pos;
-        if pos < bytes.len() && bytes[pos] == b'-' { pos += 1; }
-        while pos < bytes.len() && (bytes[pos].is_ascii_digit() || bytes[pos] == b'.') {
-            pos += 1;
-        }
-        if pos > num_start {
-            if let Ok(n) = expr[num_start..pos].parse::<f32>() {
-                tokens.push(CalcToken::Num(n));
-                continue;
-            }
-        }
-
-        pos += 1;
-    }
-
-    // First pass: * and /
-    let mut simplified: Vec<CalcToken> = Vec::new();
-    let mut i = 0;
-    while i < tokens.len() {
-        if let CalcToken::Op(op) = &tokens[i] {
-            if (*op == '*' || *op == '/') && !simplified.is_empty() {
-                if let (Some(CalcToken::Num(lhs)), Some(CalcToken::Num(rhs))) =
-                    (simplified.last().cloned(), tokens.get(i + 1))
-                {
-                    let result = if *op == '*' { lhs * rhs } else if rhs.abs() > f32::EPSILON { lhs / rhs } else { lhs };
-                    *simplified.last_mut().unwrap() = CalcToken::Num(result);
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-        simplified.push(tokens[i].clone());
-        i += 1;
-    }
-
-    // Second pass: + and -
-    let mut result = match simplified.first() {
-        Some(CalcToken::Num(n)) => *n,
-        _ => return None,
-    };
-    let mut j = 1;
-    while j + 1 < simplified.len() {
-        if let (CalcToken::Op(op), CalcToken::Num(rhs)) = (&simplified[j], &simplified[j + 1]) {
-            match op {
-                '+' => result += rhs,
-                '-' => result -= rhs,
-                _ => {}
-            }
-            j += 2;
-        } else {
-            j += 1;
-        }
-    }
-
-    Some(result)
+/// Public alias for `resolve_var` — re-exported by the CSS module for use in
+/// html.rs and v8_runtime.rs.
+pub fn resolve_var_pub(value: &str, variables: &HashMap<String, String>) -> String {
+    resolve_var(value, variables)
 }
 
-#[derive(Debug, Clone)]
-enum CalcToken {
-    Num(f32),
-    Op(char),
-}
+// ═════════════════════════════════════════════════════════════════════════════
+//  COLOR PARSING
+// ═════════════════════════════════════════════════════════════════════════════
 
-// ───────────────────────────── Pixel parsing ─────────────────────────────────
-
-/// Parse a px value.
-pub fn parse_px(value: &str) -> Option<f32> {
-    let value = value.trim();
-    if value.starts_with("calc(") {
-        if let Dimension::Px(v) = parse_dimension(value) {
-            return Some(v);
-        }
-        return None;
-    }
-    if let Some(v) = value.strip_suffix("px") {
-        v.trim().parse::<f32>().ok()
-    } else {
-        value.parse::<f32>().ok()
-    }
-}
-
-/// Parse `backdrop-filter` blur amount from values like `blur(8px)`.
-pub fn parse_backdrop_blur(value: &str) -> Option<f32> {
-    let v = value.trim();
-    let start = v.find("blur(")?;
-    let inner = &v[start + 5..];
-    let end = inner.rfind(')')?;
-    let expr = inner[..end].trim();
-    parse_px(expr)
-}
-
-/// Parse transform scale from values like `scale(1.2)`.
-pub fn parse_transform_scale(value: &str) -> Option<f32> {
-    let v = value.trim();
-    let start = v.find("scale(")?;
-    let inner = &v[start + 6..];
-    let end = inner.find(')')?;
-    inner[..end].trim().parse::<f32>().ok()
-}
-
-// ───────────────────────────── Color parsing ─────────────────────────────────
-
-/// Parse a CSS color value.
+/// Parse a CSS color value into a `Color`.
+///
+/// Supports:
+///   - `transparent`
+///   - Named colors (all 148 CSS Level 4 named colors)
+///   - `#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`
+///   - `rgb(r, g, b)` / `rgb(r g b)`
+///   - `rgba(r, g, b, a)` / `rgb(r g b / a)`
+///   - `hsl(h, s%, l%)` / `hsl(h s% l%)`
+///   - `hsla(h, s%, l%, a)` / `hsl(h s% l% / a)`
 pub fn parse_color(value: &str) -> Option<Color> {
     let value = value.trim();
-
-    match value {
-        "transparent" => return Some(Color::TRANSPARENT),
-        "white" => return Some(Color::WHITE),
-        "black" => return Some(Color::BLACK),
-        "red" => return Some(Color::new(1.0, 0.0, 0.0, 1.0)),
-        "green" => return Some(Color::new(0.0, 0.5, 0.0, 1.0)),
-        "blue" => return Some(Color::new(0.0, 0.0, 1.0, 1.0)),
-        "yellow" => return Some(Color::new(1.0, 1.0, 0.0, 1.0)),
-        "orange" => return Some(Color::new(1.0, 0.647, 0.0, 1.0)),
-        "gray" | "grey" => return Some(Color::new(0.5, 0.5, 0.5, 1.0)),
-        _ => {}
+    if value.is_empty() {
+        return None;
     }
 
-    // Hex
+    // Transparent
+    if value.eq_ignore_ascii_case("transparent") {
+        return Some(Color::TRANSPARENT);
+    }
+
+    // currentColor / inherit — not resolved here (caller decides)
+    if value.eq_ignore_ascii_case("currentcolor") || value.eq_ignore_ascii_case("inherit") {
+        return None;
+    }
+
+    // Hex colors
     if value.starts_with('#') {
-        return Color::from_hex(value);
+        return parse_hex_color(value);
     }
 
-    // rgba()
-    if let Some(args) = value.strip_prefix("rgba(").and_then(|s| s.strip_suffix(')')) {
-        let nums: Vec<f32> = args.split(',').filter_map(|s| parse_color_component(s)).collect();
-        if nums.len() >= 4 {
-            let r = if nums[0] > 1.0 { nums[0] / 255.0 } else { nums[0] };
-            let g = if nums[1] > 1.0 { nums[1] / 255.0 } else { nums[1] };
-            let b = if nums[2] > 1.0 { nums[2] / 255.0 } else { nums[2] };
-            return Some(Color::new(r, g, b, nums[3]));
-        }
+    // rgb() / rgba()
+    if value.starts_with("rgb") {
+        return parse_rgb_color(value);
     }
 
-    // rgb()
-    if let Some(args) = value.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-        let nums: Vec<f32> = args.split(',').filter_map(|s| parse_color_component(s)).collect();
-        if nums.len() >= 3 {
-            let r = if nums[0] > 1.0 { nums[0] / 255.0 } else { nums[0] };
-            let g = if nums[1] > 1.0 { nums[1] / 255.0 } else { nums[1] };
-            let b = if nums[2] > 1.0 { nums[2] / 255.0 } else { nums[2] };
-            return Some(Color::new(r, g, b, 1.0));
-        }
+    // hsl() / hsla()
+    if value.starts_with("hsl") {
+        return parse_hsl_color(value);
     }
 
-    // hsla()
-    if let Some(args) = value.strip_prefix("hsla(").and_then(|s| s.strip_suffix(')')) {
-        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
-        if parts.len() >= 4 {
-            let h = parse_hue_degrees(parts[0])?;
-            let s = parse_percentage_unit(parts[1])?;
-            let l = parse_percentage_unit(parts[2])?;
-            let a = parse_color_component(parts[3])?.clamp(0.0, 1.0);
-            let (r, g, b) = hsl_to_rgb(h, s, l);
-            return Some(Color::new(r, g, b, a));
-        }
-    }
-
-    // hsl()
-    if let Some(args) = value.strip_prefix("hsl(").and_then(|s| s.strip_suffix(')')) {
-        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
-        if parts.len() >= 3 {
-            let h = parse_hue_degrees(parts[0])?;
-            let s = parse_percentage_unit(parts[1])?;
-            let l = parse_percentage_unit(parts[2])?;
-            let (r, g, b) = hsl_to_rgb(h, s, l);
-            return Some(Color::new(r, g, b, 1.0));
-        }
-    }
-
-    None
+    // Named colors
+    named_color(value)
 }
 
-fn parse_hue_degrees(raw: &str) -> Option<f32> {
-    let s = raw.trim().trim_end_matches("deg").trim();
-    s.parse::<f32>().ok()
-}
-
-fn parse_percentage_unit(raw: &str) -> Option<f32> {
-    let s = raw.trim();
-    if let Some(v) = s.strip_suffix('%') {
-        return v.trim().parse::<f32>().ok().map(|n| (n / 100.0).clamp(0.0, 1.0));
-    }
-    s.parse::<f32>().ok().map(|n| n.clamp(0.0, 1.0))
-}
-
-pub(crate) fn hsl_to_rgb(h_deg: f32, s: f32, l: f32) -> (f32, f32, f32) {
-    let h = h_deg.rem_euclid(360.0) / 360.0;
-    if s <= f32::EPSILON {
-        return (l, l, l);
-    }
-
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
-    let p = 2.0 * l - q;
-
-    fn hue_to_channel(p: f32, q: f32, mut t: f32) -> f32 {
-        if t < 0.0 { t += 1.0; }
-        if t > 1.0 { t -= 1.0; }
-        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
-        if t < 1.0 / 2.0 { return q; }
-        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
-        p
-    }
-
-    (
-        hue_to_channel(p, q, h + 1.0 / 3.0),
-        hue_to_channel(p, q, h),
-        hue_to_channel(p, q, h - 1.0 / 3.0),
-    )
-}
-
-/// Parse a single color component (number, percentage, or calc()).
-pub(crate) fn parse_color_component(s: &str) -> Option<f32> {
-    let s = s.trim();
-    if s.ends_with('%') {
-        return s.trim_end_matches('%').parse::<f32>().ok().map(|v| v / 100.0);
-    }
-    if let Ok(v) = s.parse::<f32>() {
-        return Some(v);
-    }
-    if let Some(inner) = s.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
-        return eval_calc_expr(inner);
-    }
-    if s.contains('*') || s.contains('/') || (s.contains('+') && !s.starts_with('+')) || (s.contains('-') && !s.starts_with('-') && s.len() > 1) {
-        return eval_calc_expr(s);
-    }
-    None
-}
-
-// ───────────────────────────── Gradient parsing ──────────────────────────────
-
-/// Split a string on commas, but respect nested parentheses.
-pub fn split_comma_aware(s: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0;
-    for ch in s.chars() {
-        if ch == '(' { depth += 1; current.push(ch); }
-        else if ch == ')' { depth -= 1; current.push(ch); }
-        else if ch == ',' && depth == 0 {
-            tokens.push(current.trim().to_string());
-            current.clear();
-        } else {
-            current.push(ch);
-        }
-    }
-    let t = current.trim().to_string();
-    if !t.is_empty() { tokens.push(t); }
-    tokens
-}
-
-/// Parse a CSS `linear-gradient(angle, stop1, stop2, ...)` value.
-pub fn parse_linear_gradient(value: &str) -> Option<Background> {
-    let inner = value.strip_prefix("linear-gradient(")
-        .and_then(|s| s.strip_suffix(')'))?;
-    let parts = split_comma_aware(inner);
-    if parts.is_empty() { return None; }
-
-    let mut idx = 0;
-    let mut angle_deg: f32 = 180.0;
-
-    let first = parts[0].trim();
-    if first.ends_with("deg") {
-        if let Ok(a) = first.trim_end_matches("deg").trim().parse::<f32>() {
-            angle_deg = a;
-            idx = 1;
-        }
-    } else if first.starts_with("to ") {
-        angle_deg = match first {
-            "to top" => 0.0,
-            "to right" => 90.0,
-            "to bottom" => 180.0,
-            "to left" => 270.0,
-            "to top right" | "to right top" => 45.0,
-            "to bottom right" | "to right bottom" => 135.0,
-            "to bottom left" | "to left bottom" => 225.0,
-            "to top left" | "to left top" => 315.0,
-            _ => 180.0,
-        };
-        idx = 1;
-    }
-
-    let stop_parts: Vec<&str> = parts[idx..].iter().map(|s| s.as_str()).collect();
-    if stop_parts.is_empty() { return None; }
-
-    let mut stops = Vec::new();
-    let n = stop_parts.len();
-    for (i, part) in stop_parts.iter().enumerate() {
-        let part = part.trim();
-        let (color_str, position) = if let Some(pct_idx) = part.rfind('%') {
-            let before = &part[..pct_idx];
-            if let Some(space_idx) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.' && c != '-') {
-                let num_str = &part[space_idx+1..pct_idx];
-                let pos = num_str.parse::<f32>().unwrap_or(i as f32 / (n - 1).max(1) as f32 * 100.0) / 100.0;
-                (&part[..=space_idx], Some(pos))
+/// Parse `#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`.
+fn parse_hex_color(value: &str) -> Option<Color> {
+    let hex = value.trim_start_matches('#');
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(if hex.len() <= 4 { 1 } else { 2 })
+        .filter_map(|i| {
+            if hex.len() <= 4 {
+                // Short form: double each digit
+                let ch = &hex[i..i + 1];
+                u8::from_str_radix(&format!("{}{}", ch, ch), 16).ok()
             } else {
-                (part, None)
-            }
-        } else {
-            let words: Vec<&str> = part.rsplitn(2, char::is_whitespace).collect();
-            if words.len() == 2 {
-                if let Some(px) = parse_px(words[0]) {
-                    (words[1], Some(px / 100.0))
+                if i + 2 <= hex.len() {
+                    u8::from_str_radix(&hex[i..i + 2], 16).ok()
                 } else {
-                    (part, None)
+                    None
                 }
-            } else {
-                (part, None)
             }
-        };
-
-        let position = position.unwrap_or_else(|| {
-            if n <= 1 { 0.0 } else { i as f32 / (n - 1) as f32 }
-        });
-
-        if let Some(color) = parse_color(color_str.trim()) {
-            stops.push(GradientStop { color, position });
-        }
-    }
-
-    if stops.is_empty() { return None; }
-
-    Some(Background::LinearGradient { angle_deg, stops })
-}
-
-/// Parse a CSS `radial-gradient(stop1, stop2, ...)` value.
-pub fn parse_radial_gradient(value: &str) -> Option<Background> {
-    let inner = value.strip_prefix("radial-gradient(")
-        .and_then(|s| s.strip_suffix(')'))?;
-    let parts = split_comma_aware(inner);
-    if parts.is_empty() { return None; }
-
-    let mut stops = Vec::new();
-    let n = parts.len();
-    for (i, part) in parts.iter().enumerate() {
-        let part = part.trim();
-        if i == 0 && (part.starts_with("circle") || part.starts_with("ellipse") || part.starts_with("closest") || part.starts_with("farthest")) {
-            continue;
-        }
-
-        let (color_str, position) = if let Some(pct_idx) = part.rfind('%') {
-            let before = &part[..pct_idx];
-            if let Some(space_idx) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.' && c != '-') {
-                let num_str = &part[space_idx+1..pct_idx];
-                let pos = num_str.parse::<f32>().unwrap_or(i as f32 / (n - 1).max(1) as f32 * 100.0) / 100.0;
-                (&part[..=space_idx], Some(pos))
-            } else {
-                (part, None)
-            }
-        } else {
-            (part, None)
-        };
-
-        let position = position.unwrap_or_else(|| {
-            if n <= 1 { 0.0 } else { i as f32 / (n - 1) as f32 }
-        });
-
-        if let Some(color) = parse_color(color_str.trim()) {
-            stops.push(GradientStop { color, position });
-        }
-    }
-
-    if stops.is_empty() { return None; }
-
-    Some(Background::RadialGradient { stops })
-}
-
-// ───────────────────────────── Box shadow parsing ────────────────────────────
-
-/// Parse a single `box-shadow` value: `offset-x offset-y blur-radius spread-radius color`
-pub fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
-    let value = value.trim();
-    if value == "none" || value.is_empty() { return None; }
-
-    let (color, remainder) = if let Some(rgba_start) = value.find("rgba(") {
-        let end = value[rgba_start..].find(')').map(|e| rgba_start + e + 1)?;
-        let c = parse_color(&value[rgba_start..end])?;
-        let rest = format!("{} {}", &value[..rgba_start], &value[end..]);
-        (c, rest)
-    } else if let Some(rgb_start) = value.find("rgb(") {
-        let end = value[rgb_start..].find(')').map(|e| rgb_start + e + 1)?;
-        let c = parse_color(&value[rgb_start..end])?;
-        let rest = format!("{} {}", &value[..rgb_start], &value[end..]);
-        (c, rest)
-    } else {
-        let tokens: Vec<&str> = value.split_whitespace().collect();
-        if tokens.len() >= 3 {
-            if let Some(c) = tokens.last().and_then(|t| parse_color(t)) {
-                let rest = tokens[..tokens.len()-1].join(" ");
-                (c, rest)
-            } else {
-                (Color::new(0.0, 0.0, 0.0, 0.5), value.to_string())
-            }
-        } else {
-            return None;
-        }
-    };
-
-    let nums: Vec<f32> = remainder.split_whitespace()
-        .filter_map(|t| parse_px(t))
+        })
         .collect();
 
-    let offset_x = nums.first().copied().unwrap_or(0.0);
-    let offset_y = nums.get(1).copied().unwrap_or(0.0);
-    let blur_radius = nums.get(2).copied().unwrap_or(0.0);
-    let spread_radius = nums.get(3).copied().unwrap_or(0.0);
-
-    Some(BoxShadow { offset_x, offset_y, blur_radius, spread_radius, color, inset: false })
+    match bytes.len() {
+        3 => Some(Color::new(
+            bytes[0] as f32 / 255.0,
+            bytes[1] as f32 / 255.0,
+            bytes[2] as f32 / 255.0,
+            1.0,
+        )),
+        4 => Some(Color::new(
+            bytes[0] as f32 / 255.0,
+            bytes[1] as f32 / 255.0,
+            bytes[2] as f32 / 255.0,
+            bytes[3] as f32 / 255.0,
+        )),
+        _ => None,
+    }
 }
 
-// ───────────────────────────── Shorthand parsing ─────────────────────────────
+/// Parse `rgb(...)` or `rgba(...)`.
+fn parse_rgb_color(value: &str) -> Option<Color> {
+    let inner = extract_function_args(value)?;
+    let parts = split_color_args(&inner);
 
-/// Parse a CSS shorthand with 1–4 values (margin, padding, etc.).
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let r = parse_color_channel(&parts[0], 255.0)?;
+    let g = parse_color_channel(&parts[1], 255.0)?;
+    let b = parse_color_channel(&parts[2], 255.0)?;
+    let a = if parts.len() >= 4 {
+        parse_alpha_value(&parts[3])?
+    } else {
+        1.0
+    };
+
+    Some(Color::new(r, g, b, a))
+}
+
+/// Parse `hsl(...)` or `hsla(...)`.
+fn parse_hsl_color(value: &str) -> Option<Color> {
+    let inner = extract_function_args(value)?;
+    let parts = split_color_args(&inner);
+
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let h: f32 = parts[0]
+        .trim()
+        .trim_end_matches("deg")
+        .trim_end_matches("turn")
+        .parse()
+        .ok()?;
+    let h = if parts[0].contains("turn") { h * 360.0 } else { h };
+    let s: f32 = parts[1].trim().trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+    let l: f32 = parts[2].trim().trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+    let a = if parts.len() >= 4 {
+        parse_alpha_value(&parts[3])?
+    } else {
+        1.0
+    };
+
+    let (r, g, b) = hsl_to_rgb(h, s, l);
+    Some(Color::new(r, g, b, a))
+}
+
+/// Extract the arguments from a CSS function: `fn(...)` → `...`.
+fn extract_function_args(value: &str) -> Option<String> {
+    let open = value.find('(')?;
+    let close = value.rfind(')')?;
+    if close > open + 1 {
+        Some(value[open + 1..close].to_string())
+    } else {
+        None
+    }
+}
+
+/// Split color function arguments, handling both comma-separated and space/slash
+/// modern syntax: `r, g, b, a` or `r g b / a`.
+fn split_color_args(inner: &str) -> Vec<String> {
+    if inner.contains(',') {
+        inner.split(',').map(|s| s.trim().to_string()).collect()
+    } else {
+        // Modern syntax: `r g b` or `r g b / a`
+        let parts: Vec<&str> = inner.split_whitespace().collect();
+        let mut result = Vec::new();
+        let mut saw_slash = false;
+        for part in parts {
+            if part == "/" {
+                saw_slash = true;
+                continue;
+            }
+            result.push(part.to_string());
+        }
+        // If there was a slash, the last part is alpha; it's already in the vec.
+        let _ = saw_slash; // The alpha is just the last element after the slash
+        result
+    }
+}
+
+/// Parse a color channel value: number (0–255) or percentage (0%–100%).
+fn parse_color_channel(s: &str, max: f32) -> Option<f32> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        let v: f32 = pct.trim().parse().ok()?;
+        Some((v / 100.0).clamp(0.0, 1.0))
+    } else {
+        let v: f32 = s.parse().ok()?;
+        Some((v / max).clamp(0.0, 1.0))
+    }
+}
+
+/// Parse an alpha value: number (0.0–1.0) or percentage (0%–100%).
+fn parse_alpha_value(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        let v: f32 = pct.trim().parse().ok()?;
+        Some((v / 100.0).clamp(0.0, 1.0))
+    } else {
+        let v: f32 = s.parse().ok()?;
+        Some(v.clamp(0.0, 1.0))
+    }
+}
+
+/// Convert HSL to RGB (all values 0.0–1.0 except h which is 0–360).
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s == 0.0 {
+        return (l, l, l);
+    }
+    let h = ((h % 360.0) + 360.0) % 360.0 / 360.0;
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let r = hue_to_rgb(p, q, h + 1.0 / 3.0);
+    let g = hue_to_rgb(p, q, h);
+    let b = hue_to_rgb(p, q, h - 1.0 / 3.0);
+    (r, g, b)
+}
+
+fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
+    if t < 0.0 { t += 1.0; }
+    if t > 1.0 { t -= 1.0; }
+    if t < 1.0 / 6.0 {
+        return p + (q - p) * 6.0 * t;
+    }
+    if t < 1.0 / 2.0 {
+        return q;
+    }
+    if t < 2.0 / 3.0 {
+        return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+    }
+    p
+}
+
+/// Lookup a CSS named color. Returns `Some(Color)` or `None`.
+fn named_color(name: &str) -> Option<Color> {
+    let (r, g, b) = match name.to_ascii_lowercase().as_str() {
+        "aliceblue" => (240, 248, 255),
+        "antiquewhite" => (250, 235, 215),
+        "aqua" => (0, 255, 255),
+        "aquamarine" => (127, 255, 212),
+        "azure" => (240, 255, 255),
+        "beige" => (245, 245, 220),
+        "bisque" => (255, 228, 196),
+        "black" => (0, 0, 0),
+        "blanchedalmond" => (255, 235, 205),
+        "blue" => (0, 0, 255),
+        "blueviolet" => (138, 43, 226),
+        "brown" => (165, 42, 42),
+        "burlywood" => (222, 184, 135),
+        "cadetblue" => (95, 158, 160),
+        "chartreuse" => (127, 255, 0),
+        "chocolate" => (210, 105, 30),
+        "coral" => (255, 127, 80),
+        "cornflowerblue" => (100, 149, 237),
+        "cornsilk" => (255, 248, 220),
+        "crimson" => (220, 20, 60),
+        "cyan" => (0, 255, 255),
+        "darkblue" => (0, 0, 139),
+        "darkcyan" => (0, 139, 139),
+        "darkgoldenrod" => (184, 134, 11),
+        "darkgray" | "darkgrey" => (169, 169, 169),
+        "darkgreen" => (0, 100, 0),
+        "darkkhaki" => (189, 183, 107),
+        "darkmagenta" => (139, 0, 139),
+        "darkolivegreen" => (85, 107, 47),
+        "darkorange" => (255, 140, 0),
+        "darkorchid" => (153, 50, 204),
+        "darkred" => (139, 0, 0),
+        "darksalmon" => (233, 150, 122),
+        "darkseagreen" => (143, 188, 143),
+        "darkslateblue" => (72, 61, 139),
+        "darkslategray" | "darkslategrey" => (47, 79, 79),
+        "darkturquoise" => (0, 206, 209),
+        "darkviolet" => (148, 0, 211),
+        "deeppink" => (255, 20, 147),
+        "deepskyblue" => (0, 191, 255),
+        "dimgray" | "dimgrey" => (105, 105, 105),
+        "dodgerblue" => (30, 144, 255),
+        "firebrick" => (178, 34, 34),
+        "floralwhite" => (255, 250, 240),
+        "forestgreen" => (34, 139, 34),
+        "fuchsia" => (255, 0, 255),
+        "gainsboro" => (220, 220, 220),
+        "ghostwhite" => (248, 248, 255),
+        "gold" => (255, 215, 0),
+        "goldenrod" => (218, 165, 32),
+        "gray" | "grey" => (128, 128, 128),
+        "green" => (0, 128, 0),
+        "greenyellow" => (173, 255, 47),
+        "honeydew" => (240, 255, 240),
+        "hotpink" => (255, 105, 180),
+        "indianred" => (205, 92, 92),
+        "indigo" => (75, 0, 130),
+        "ivory" => (255, 255, 240),
+        "khaki" => (240, 230, 140),
+        "lavender" => (230, 230, 250),
+        "lavenderblush" => (255, 240, 245),
+        "lawngreen" => (124, 252, 0),
+        "lemonchiffon" => (255, 250, 205),
+        "lightblue" => (173, 216, 230),
+        "lightcoral" => (240, 128, 128),
+        "lightcyan" => (224, 255, 255),
+        "lightgoldenrodyellow" => (250, 250, 210),
+        "lightgray" | "lightgrey" => (211, 211, 211),
+        "lightgreen" => (144, 238, 144),
+        "lightpink" => (255, 182, 193),
+        "lightsalmon" => (255, 160, 122),
+        "lightseagreen" => (32, 178, 170),
+        "lightskyblue" => (135, 206, 250),
+        "lightslategray" | "lightslategrey" => (119, 136, 153),
+        "lightsteelblue" => (176, 196, 222),
+        "lightyellow" => (255, 255, 224),
+        "lime" => (0, 255, 0),
+        "limegreen" => (50, 205, 50),
+        "linen" => (250, 240, 230),
+        "magenta" => (255, 0, 255),
+        "maroon" => (128, 0, 0),
+        "mediumaquamarine" => (102, 205, 170),
+        "mediumblue" => (0, 0, 205),
+        "mediumorchid" => (186, 85, 211),
+        "mediumpurple" => (147, 111, 219),
+        "mediumseagreen" => (60, 179, 113),
+        "mediumslateblue" => (123, 104, 238),
+        "mediumspringgreen" => (0, 250, 154),
+        "mediumturquoise" => (72, 209, 204),
+        "mediumvioletred" => (199, 21, 133),
+        "midnightblue" => (25, 25, 112),
+        "mintcream" => (245, 255, 250),
+        "mistyrose" => (255, 228, 225),
+        "moccasin" => (255, 228, 181),
+        "navajowhite" => (255, 222, 173),
+        "navy" => (0, 0, 128),
+        "oldlace" => (253, 245, 230),
+        "olive" => (128, 128, 0),
+        "olivedrab" => (107, 142, 35),
+        "orange" => (255, 165, 0),
+        "orangered" => (255, 69, 0),
+        "orchid" => (218, 112, 214),
+        "palegoldenrod" => (238, 232, 170),
+        "palegreen" => (152, 251, 152),
+        "paleturquoise" => (175, 238, 238),
+        "palevioletred" => (219, 112, 147),
+        "papayawhip" => (255, 239, 213),
+        "peachpuff" => (255, 218, 185),
+        "peru" => (205, 133, 63),
+        "pink" => (255, 192, 203),
+        "plum" => (221, 160, 221),
+        "powderblue" => (176, 224, 230),
+        "purple" => (128, 0, 128),
+        "rebeccapurple" => (102, 51, 153),
+        "red" => (255, 0, 0),
+        "rosybrown" => (188, 143, 143),
+        "royalblue" => (65, 105, 225),
+        "saddlebrown" => (139, 69, 19),
+        "salmon" => (250, 128, 114),
+        "sandybrown" => (244, 164, 96),
+        "seagreen" => (46, 139, 87),
+        "seashell" => (255, 245, 238),
+        "sienna" => (160, 82, 45),
+        "silver" => (192, 192, 192),
+        "skyblue" => (135, 206, 235),
+        "slateblue" => (106, 90, 205),
+        "slategray" | "slategrey" => (112, 128, 144),
+        "snow" => (255, 250, 250),
+        "springgreen" => (0, 255, 127),
+        "steelblue" => (70, 130, 180),
+        "tan" => (210, 180, 140),
+        "teal" => (0, 128, 128),
+        "thistle" => (216, 191, 216),
+        "tomato" => (255, 99, 71),
+        "turquoise" => (64, 224, 208),
+        "violet" => (238, 130, 238),
+        "wheat" => (245, 222, 179),
+        "white" => (255, 255, 255),
+        "whitesmoke" => (245, 245, 245),
+        "yellow" => (255, 255, 0),
+        "yellowgreen" => (154, 205, 50),
+        _ => return None,
+    };
+    Some(Color::new(
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        1.0,
+    ))
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  DIMENSION PARSING
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Parse a CSS dimension value into a `Dimension`.
+///
+/// Supports: `auto`, `px`, `%`, `em`, `rem`, `vh`, `vw`, `vmin`, `vmax`,
+/// `ch`, `ex`, `fr`, `calc(...)`, bare numbers, `min-content`, `max-content`,
+/// `fit-content`, `0`.
+pub fn parse_dimension(value: &str) -> Dimension {
+    let value = value.trim();
+    match value {
+        "auto" | "none" => Dimension::Auto,
+        "0" => Dimension::Px(0.0),
+        "min-content" | "max-content" | "fit-content" => Dimension::Auto,
+        _ => {
+            // Percentage
+            if let Some(pct) = value.strip_suffix('%') {
+                if let Ok(v) = pct.trim().parse::<f32>() {
+                    return Dimension::Percent(v);
+                }
+            }
+            // Pixel
+            if let Some(px) = value.strip_suffix("px") {
+                if let Ok(v) = px.trim().parse::<f32>() {
+                    return Dimension::Px(v);
+                }
+            }
+            // Em → approximate to px (assume 16px base)
+            if let Some(em) = value.strip_suffix("em") {
+                let em = em.trim_end_matches('r'); // rem → em
+                if let Ok(v) = em.trim().parse::<f32>() {
+                    return Dimension::Px(v * 16.0);
+                }
+            }
+            // Viewport units → percentage approximation
+            if let Some(vh) = value.strip_suffix("vh") {
+                if let Ok(v) = vh.trim().parse::<f32>() {
+                    return Dimension::Percent(v);
+                }
+            }
+            if let Some(vw) = value.strip_suffix("vw") {
+                if let Ok(v) = vw.trim().parse::<f32>() {
+                    return Dimension::Percent(v);
+                }
+            }
+            if let Some(vmin) = value.strip_suffix("vmin") {
+                if let Ok(v) = vmin.trim().parse::<f32>() {
+                    return Dimension::Percent(v);
+                }
+            }
+            if let Some(vmax) = value.strip_suffix("vmax") {
+                if let Ok(v) = vmax.trim().parse::<f32>() {
+                    return Dimension::Percent(v);
+                }
+            }
+            // Bare number → px
+            if let Ok(v) = value.parse::<f32>() {
+                return Dimension::Px(v);
+            }
+            // calc() — extract the first numeric value as an approximation
+            if value.starts_with("calc(") {
+                if let Some(inner) = extract_function_args(value) {
+                    // Try to extract a simple value from the calc expression
+                    for token in inner.split(|c: char| c == '+' || c == '-' || c == '*' || c == '/') {
+                        let t = token.trim();
+                        if !t.is_empty() {
+                            let dim = parse_dimension(t);
+                            if !matches!(dim, Dimension::Auto) {
+                                return dim;
+                            }
+                        }
+                    }
+                }
+            }
+            Dimension::Auto
+        }
+    }
+}
+
+/// Parse a pixel value from a CSS length string. Returns `None` for
+/// non-numeric values like `auto`.
+pub fn parse_px(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value == "0" {
+        return Some(0.0);
+    }
+    if let Some(px) = value.strip_suffix("px") {
+        return px.trim().parse::<f32>().ok();
+    }
+    if let Some(em) = value.strip_suffix("em") {
+        let em = em.trim_end_matches('r');
+        return em.trim().parse::<f32>().ok().map(|v| v * 16.0);
+    }
+    if let Some(pt) = value.strip_suffix("pt") {
+        return pt.trim().parse::<f32>().ok().map(|v| v * 1.333);
+    }
+    // Keyword widths
+    match value {
+        "thin" => return Some(1.0),
+        "medium" => return Some(3.0),
+        "thick" => return Some(5.0),
+        _ => {}
+    }
+    // Bare number
+    value.parse::<f32>().ok()
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SHORTHAND PARSING
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Parse a 1–4 value shorthand (margin, padding, border-width, etc.)
+/// into `(top, right, bottom, left)` following CSS shorthand rules.
 pub fn parse_shorthand_4(value: &str) -> (Dimension, Dimension, Dimension, Dimension) {
-    let parts = split_css_function_aware(value);
+    let parts: Vec<&str> = value.split_whitespace().collect();
     match parts.len() {
         1 => {
-            let v = parse_dimension(&parts[0]);
+            let v = parse_dimension(parts[0]);
             (v, v, v, v)
         }
         2 => {
-            let tb = parse_dimension(&parts[0]);
-            let lr = parse_dimension(&parts[1]);
+            let tb = parse_dimension(parts[0]);
+            let lr = parse_dimension(parts[1]);
             (tb, lr, tb, lr)
         }
         3 => {
-            let t = parse_dimension(&parts[0]);
-            let lr = parse_dimension(&parts[1]);
-            let b = parse_dimension(&parts[2]);
+            let t = parse_dimension(parts[0]);
+            let lr = parse_dimension(parts[1]);
+            let b = parse_dimension(parts[2]);
             (t, lr, b, lr)
         }
-        4 => {
-            (parse_dimension(&parts[0]), parse_dimension(&parts[1]),
-             parse_dimension(&parts[2]), parse_dimension(&parts[3]))
+        4 => (
+            parse_dimension(parts[0]),
+            parse_dimension(parts[1]),
+            parse_dimension(parts[2]),
+            parse_dimension(parts[3]),
+        ),
+        _ => {
+            let v = parse_dimension(value);
+            (v, v, v, v)
         }
-        _ => (Dimension::Px(0.0), Dimension::Px(0.0), Dimension::Px(0.0), Dimension::Px(0.0)),
     }
 }
 
-/// Split a CSS value on whitespace, respecting parenthesized groups like `calc(...)`.
+/// Split a CSS value string into tokens, respecting parenthesized functions.
+/// E.g. `"10px rgba(0,0,0,0.5) 20px"` → `["10px", "rgba(0,0,0,0.5)", "20px"]`.
 pub fn split_css_function_aware(value: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut depth = 0;
 
     for ch in value.chars() {
-        if ch == '(' {
-            depth += 1;
-            current.push(ch);
-        } else if ch == ')' {
-            depth -= 1;
-            current.push(ch);
-        } else if ch.is_ascii_whitespace() && depth == 0 {
-            let trimmed = current.trim().to_string();
-            if !trimmed.is_empty() {
-                tokens.push(trimmed);
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
             }
-            current.clear();
-        } else {
-            current.push(ch);
+            ')' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ' ' | '\t' if depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed);
+                }
+                current.clear();
+            }
+            ',' if depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
         }
     }
     let trimmed = current.trim().to_string();
@@ -605,156 +628,482 @@ pub fn split_css_function_aware(value: &str) -> Vec<String> {
     tokens
 }
 
-// ───────────────────────────── CSS variable resolution ───────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  GRADIENT PARSING
+// ═════════════════════════════════════════════════════════════════════════════
 
-/// Resolve CSS `var(--name)` references (internal).
-pub(crate) fn resolve_var(value: &str, variables: &HashMap<String, String>) -> String {
-    resolve_var_pub(value, variables)
+/// Parse a `linear-gradient(...)` value into a `Background::LinearGradient`.
+pub fn parse_linear_gradient(value: &str) -> Option<Background> {
+    let value = value.trim();
+    if !value.starts_with("linear-gradient(") {
+        return None;
+    }
+    let inner = extract_function_args(value)?;
+    let parts = split_gradient_args(&inner);
+
+    let mut angle_deg: f32 = 180.0; // default: top to bottom
+    let mut color_parts = &parts[..];
+
+    // First part might be an angle or direction keyword.
+    if let Some(first) = parts.first() {
+        let first_trimmed = first.trim();
+        if first_trimmed.starts_with("to ") {
+            angle_deg = match first_trimmed {
+                "to top" => 0.0,
+                "to right" => 90.0,
+                "to bottom" => 180.0,
+                "to left" => 270.0,
+                "to top right" | "to right top" => 45.0,
+                "to bottom right" | "to right bottom" => 135.0,
+                "to bottom left" | "to left bottom" => 225.0,
+                "to top left" | "to left top" => 315.0,
+                _ => 180.0,
+            };
+            color_parts = &parts[1..];
+        } else if let Some(angle) = parse_angle(first_trimmed) {
+            angle_deg = angle;
+            color_parts = &parts[1..];
+        }
+    }
+
+    let stops = parse_gradient_stops(color_parts)?;
+    Some(Background::LinearGradient { angle_deg, stops })
 }
 
-/// Public version of resolve_var for use by the HTML compiler.
-pub fn resolve_var_pub(value: &str, variables: &HashMap<String, String>) -> String {
-    let mut result = value.to_string();
-    while let Some(start) = result.find("var(") {
-        let open = start + 3;
-        let Some(close) = find_matching_paren(&result, open) else {
+/// Parse a `radial-gradient(...)` value into a `Background::RadialGradient`.
+pub fn parse_radial_gradient(value: &str) -> Option<Background> {
+    let value = value.trim();
+    if !value.starts_with("radial-gradient(") {
+        return None;
+    }
+    let inner = extract_function_args(value)?;
+    let parts = split_gradient_args(&inner);
+
+    // Skip shape/extent keywords, just parse color stops.
+    let mut color_start = 0;
+    for (i, part) in parts.iter().enumerate() {
+        let p = part.trim().to_ascii_lowercase();
+        if p.contains("circle")
+            || p.contains("ellipse")
+            || p.contains("closest")
+            || p.contains("farthest")
+            || p.starts_with("at ")
+        {
+            color_start = i + 1;
+        } else {
             break;
+        }
+    }
+
+    let stops = parse_gradient_stops(&parts[color_start..])?;
+    Some(Background::RadialGradient { stops })
+}
+
+/// Split gradient arguments by commas, respecting nested functions.
+fn split_gradient_args(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+
+    for ch in inner.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    let remaining = current.trim().to_string();
+    if !remaining.is_empty() {
+        parts.push(remaining);
+    }
+    parts
+}
+
+/// Parse gradient color stops from a list of comma-separated parts.
+fn parse_gradient_stops(parts: &[String]) -> Option<Vec<GradientStop>> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut stops = Vec::new();
+    let count = parts.len();
+
+    for (i, part) in parts.iter().enumerate() {
+        let tokens: Vec<&str> = part.trim().splitn(2, ' ').collect();
+        let color_str = tokens[0];
+        let position = if tokens.len() > 1 {
+            parse_stop_position(tokens[1])
+        } else {
+            // Default evenly spaced positions.
+            if count == 1 {
+                0.5
+            } else {
+                i as f32 / (count - 1) as f32
+            }
         };
 
-        let inner = result[open + 1..close].trim();
-        let (var_name, default) = split_top_level_comma(inner)
-            .map(|(name, def)| (name.trim(), Some(def.trim().to_string())))
-            .unwrap_or((inner, None));
-
-        let replacement = variables
-            .get(var_name)
-            .cloned()
-            .or(default)
-            .unwrap_or_default();
-
-        result = format!("{}{}{}", &result[..start], replacement, &result[close + 1..]);
+        if let Some(color) = parse_color(color_str) {
+            stops.push(GradientStop { color, position });
+        }
     }
-    result
+
+    if stops.len() >= 2 {
+        Some(stops)
+    } else {
+        None
+    }
 }
 
-fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
-    let bytes = s.as_bytes();
-    if open_idx >= bytes.len() || bytes[open_idx] != b'(' {
+/// Parse a gradient stop position: `50%` → 0.5, `100px` → approximate.
+fn parse_stop_position(s: &str) -> f32 {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0
+    } else if let Some(px) = parse_px(s) {
+        // Approximate: treat pixels as fraction of a 1000px gradient.
+        (px / 1000.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Parse a CSS angle value: `90deg`, `0.25turn`, `100grad`, `1.57rad`.
+fn parse_angle(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(deg) = s.strip_suffix("deg") {
+        return deg.trim().parse::<f32>().ok();
+    }
+    if let Some(turn) = s.strip_suffix("turn") {
+        return turn.trim().parse::<f32>().ok().map(|v| v * 360.0);
+    }
+    if let Some(grad) = s.strip_suffix("grad") {
+        return grad.trim().parse::<f32>().ok().map(|v| v * 0.9);
+    }
+    if let Some(rad) = s.strip_suffix("rad") {
+        return rad.trim().parse::<f32>().ok().map(|v| v.to_degrees());
+    }
+    // Bare number assumed degrees
+    s.parse::<f32>().ok()
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  BOX SHADOW PARSING
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Parse a CSS `box-shadow` value.
+///
+/// Syntax: `[inset] <offset-x> <offset-y> [<blur-radius>] [<spread-radius>] <color>`
+pub fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
+    let value = value.trim();
+    if value == "none" {
         return None;
     }
 
-    let mut depth = 0usize;
-    for (i, b) in bytes.iter().enumerate().skip(open_idx) {
-        match *b {
-            b'(' => depth += 1,
-            b')' => {
-                if depth == 0 {
-                    return None;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
+    let inset = value.contains("inset");
+    let value = value.replace("inset", "");
+    let tokens = split_css_function_aware(&value);
+
+    let mut numbers = Vec::new();
+    let mut color = Color::new(0.0, 0.0, 0.0, 0.25); // default shadow color
+
+    for token in &tokens {
+        if let Some(px) = parse_px(token) {
+            numbers.push(px);
+        } else if let Some(c) = parse_color(token) {
+            color = c;
+        }
+    }
+
+    let offset_x = *numbers.first().unwrap_or(&0.0);
+    let offset_y = *numbers.get(1).unwrap_or(&0.0);
+    let blur_radius = *numbers.get(2).unwrap_or(&0.0);
+    let spread_radius = *numbers.get(3).unwrap_or(&0.0);
+
+    Some(BoxShadow {
+        offset_x,
+        offset_y,
+        blur_radius,
+        spread_radius,
+        color,
+        inset,
+    })
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  FILTER / TRANSFORM PARSING
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Parse `backdrop-filter: blur(Xpx)` → blur radius in px.
+pub fn parse_backdrop_blur(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if let Some(start) = value.find("blur(") {
+        let rest = &value[start + 5..];
+        if let Some(end) = rest.find(')') {
+            return parse_px(&rest[..end]);
         }
     }
     None
 }
 
-fn split_top_level_comma(s: &str) -> Option<(&str, &str)> {
-    let mut depth = 0usize;
-    for (i, b) in s.as_bytes().iter().enumerate() {
-        match *b {
-            b'(' => depth += 1,
-            b')' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
-            b',' if depth == 0 => {
-                return Some((&s[..i], &s[i + 1..]));
-            }
-            _ => {}
+/// Parse `transform: scale(X)` → scale factor.
+/// Also handles `scaleX(X)`, `scaleY(X)`, `scale(X, Y)`.
+pub fn parse_transform_scale(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if let Some(start) = value.find("scale(") {
+        let rest = &value[start + 6..];
+        if let Some(end) = rest.find(')') {
+            let inner = &rest[..end];
+            // scale(x, y) — return x
+            let x_str = inner.split(',').next()?.trim();
+            return x_str.parse::<f32>().ok();
+        }
+    }
+    if let Some(start) = value.find("scaleX(") {
+        let rest = &value[start + 7..];
+        if let Some(end) = rest.find(')') {
+            return rest[..end].trim().parse::<f32>().ok();
+        }
+    }
+    if let Some(start) = value.find("scaleY(") {
+        let rest = &value[start + 7..];
+        if let Some(end) = rest.find(')') {
+            return rest[..end].trim().parse::<f32>().ok();
         }
     }
     None
 }
 
-// ───────────────────────────── Grid parsing ──────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  GRID PARSING
+// ═════════════════════════════════════════════════════════════════════════════
 
-/// Parse a `grid-template-columns` or `grid-template-rows` value into track sizes.
+/// Parse a `grid-template-columns` / `grid-template-rows` value.
 pub fn parse_grid_template(value: &str) -> Vec<GridTrackSize> {
     let value = value.trim();
+    if value == "none" || value == "auto" {
+        return Vec::new();
+    }
 
-    // Handle repeat()
+    let mut tracks = Vec::new();
+
+    // Handle repeat(N, track)
     if value.starts_with("repeat(") {
-        if let Some(inner) = value.strip_prefix("repeat(").and_then(|s| s.strip_suffix(')')) {
-            if let Some((count_str, track_str)) = inner.split_once(',') {
-                let count = count_str.trim().parse::<usize>().unwrap_or(1);
-                let track = parse_single_grid_track(track_str.trim());
-                return vec![track; count];
+        if let Some(inner) = extract_function_args(value) {
+            let parts: Vec<&str> = inner.splitn(2, ',').collect();
+            if parts.len() == 2 {
+                let count: usize = parts[0].trim().parse().unwrap_or(1);
+                let track = parse_single_track(parts[1].trim());
+                for _ in 0..count {
+                    tracks.push(track.clone());
+                }
             }
         }
+        return tracks;
     }
 
-    let tokens = split_css_function_aware(value);
-    tokens.iter().map(|t| parse_single_grid_track(t)).collect()
+    for token in split_css_function_aware(value) {
+        // Handle repeat() inside a multi-track definition
+        if token.starts_with("repeat(") {
+            if let Some(inner) = extract_function_args(&token) {
+                let parts: Vec<&str> = inner.splitn(2, ',').collect();
+                if parts.len() == 2 {
+                    let count: usize = parts[0].trim().parse().unwrap_or(1);
+                    let track = parse_single_track(parts[1].trim());
+                    for _ in 0..count {
+                        tracks.push(track.clone());
+                    }
+                }
+            }
+        } else {
+            tracks.push(parse_single_track(&token));
+        }
+    }
+    tracks
 }
 
-/// Parse a single grid track size value.
-pub(crate) fn parse_single_grid_track(value: &str) -> GridTrackSize {
-    let value = value.trim();
-    if value == "auto" {
+/// Parse a single grid track size token.
+fn parse_single_track(s: &str) -> GridTrackSize {
+    let s = s.trim();
+    if s == "auto" {
         return GridTrackSize::Auto;
     }
-    if value == "min-content" {
+    if s == "min-content" {
         return GridTrackSize::MinContent;
     }
-    if value == "max-content" {
+    if s == "max-content" {
         return GridTrackSize::MaxContent;
     }
-    if let Some(fr_str) = value.strip_suffix("fr") {
-        if let Ok(v) = fr_str.trim().parse::<f32>() {
+    if let Some(fr) = s.strip_suffix("fr") {
+        if let Ok(v) = fr.trim().parse::<f32>() {
             return GridTrackSize::Fr(v);
         }
     }
-    if let Some(pct_str) = value.strip_suffix('%') {
-        if let Ok(v) = pct_str.trim().parse::<f32>() {
+    if let Some(pct) = s.strip_suffix('%') {
+        if let Ok(v) = pct.trim().parse::<f32>() {
             return GridTrackSize::Percent(v);
         }
     }
-    match parse_dimension(value) {
-        Dimension::Px(v) => GridTrackSize::Px(v),
-        Dimension::Percent(v) => GridTrackSize::Percent(v),
-        _ => GridTrackSize::Auto,
+    if let Some(px) = parse_px(s) {
+        return GridTrackSize::Px(px);
     }
+    GridTrackSize::Auto
 }
 
-/// Parse a grid placement shorthand like "1 / -1", "1 / 3", "span 2", "auto".
+/// Parse `grid-column` / `grid-row` shorthand: `start / end`.
 pub fn parse_grid_placement(value: &str) -> (i32, i32) {
-    let value = value.trim();
-    if value == "auto" {
-        return (0, 0);
-    }
     if let Some((start_str, end_str)) = value.split_once('/') {
         let start = parse_grid_line(start_str.trim());
         let end = parse_grid_line(end_str.trim());
         (start, end)
-    } else if value.starts_with("span") {
-        let span = value.strip_prefix("span").and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(1);
-        (0, span + 1000) // Encode span as > 1000 so layout can detect it
     } else {
-        let line = parse_grid_line(value);
-        (line, 0)
+        let start = parse_grid_line(value.trim());
+        (start, 0)
     }
 }
 
-/// Parse a single grid line number: "1", "-1", "auto", "span 2".
+/// Parse a grid line value: number, `span N`, `auto`, or `-1`.
 pub fn parse_grid_line(value: &str) -> i32 {
     let value = value.trim();
     if value == "auto" {
         return 0;
     }
+    if let Some(span_str) = value.strip_prefix("span") {
+        let n: i32 = span_str.trim().parse().unwrap_or(1);
+        return -n; // negative = span
+    }
     value.parse::<i32>().unwrap_or(0)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  TRANSITION PARSING
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Parse a CSS `transition` shorthand into a list of `TransitionDef`.
+///
+/// Syntax: `<property> <duration> [<timing-function>] [<delay>]`
+/// Multiple transitions separated by commas.
+pub fn parse_transition(value: &str) -> Vec<TransitionDef> {
+    let mut defs = Vec::new();
+    let parts = split_gradient_args(value); // reuse comma-aware splitter
+
+    for part in &parts {
+        let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+
+        let property = tokens.first().map(|s| s.to_string()).unwrap_or_default();
+        let duration_ms = tokens.get(1).and_then(|s| parse_time_ms(s)).unwrap_or(0.0);
+        let mut easing = EasingFunction::Ease;
+        let mut delay_ms: f32 = 0.0;
+
+        // Remaining tokens: timing function and/or delay
+        for token in tokens.iter().skip(2) {
+            if let Some(e) = parse_easing(token) {
+                easing = e;
+            } else if let Some(t) = parse_time_ms(token) {
+                delay_ms = t;
+            }
+        }
+
+        if !property.is_empty() && property != "none" {
+            defs.push(TransitionDef {
+                property,
+                duration_ms,
+                delay_ms,
+                easing,
+            });
+        }
+    }
+    defs
+}
+
+/// Parse a CSS time value to milliseconds: `200ms`, `0.2s`, `1s`.
+pub fn parse_time_ms(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if let Some(ms) = value.strip_suffix("ms") {
+        return ms.trim().parse::<f32>().ok();
+    }
+    if let Some(s) = value.strip_suffix('s') {
+        return s.trim().parse::<f32>().ok().map(|v| v * 1000.0);
+    }
+    None
+}
+
+/// Parse a CSS easing function name into an `EasingFunction`.
+pub fn parse_easing(value: &str) -> Option<EasingFunction> {
+    let value = value.trim();
+    match value {
+        "linear" => Some(EasingFunction::Linear),
+        "ease" => Some(EasingFunction::Ease),
+        "ease-in" => Some(EasingFunction::EaseIn),
+        "ease-out" => Some(EasingFunction::EaseOut),
+        "ease-in-out" => Some(EasingFunction::EaseInOut),
+        _ if value.starts_with("cubic-bezier(") => {
+            let inner = extract_function_args(value)?;
+            let nums: Vec<f32> = inner.split(',')
+                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .collect();
+            if nums.len() == 4 {
+                Some(EasingFunction::CubicBezier(nums[0], nums[1], nums[2], nums[3]))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  BORDER SHORTHAND PARSING
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Parse a border shorthand value: `<width> <style> <color>`.
+/// Returns `(width, style, color)` — any component may be None.
+pub fn parse_border_shorthand(value: &str) -> (Option<f32>, Option<BorderStyle>, Option<Color>) {
+    let tokens = split_css_function_aware(value);
+    let mut width = None;
+    let mut style = None;
+    let mut color = None;
+
+    for token in &tokens {
+        // Try border style keyword first
+        if let Some(s) = parse_border_style_keyword(token) {
+            style = Some(s);
+        } else if let Some(c) = parse_color(token) {
+            color = Some(c);
+        } else if let Some(w) = parse_px(token) {
+            width = Some(w);
+        }
+    }
+
+    (width, style, color)
+}
+
+/// Parse a border-style keyword.
+pub fn parse_border_style_keyword(value: &str) -> Option<BorderStyle> {
+    match value.trim() {
+        "none" => Some(BorderStyle::None),
+        "solid" => Some(BorderStyle::Solid),
+        "dashed" => Some(BorderStyle::Dashed),
+        "dotted" => Some(BorderStyle::Dotted),
+        "double" => Some(BorderStyle::Double),
+        "groove" => Some(BorderStyle::Groove),
+        "ridge" => Some(BorderStyle::Ridge),
+        "inset" => Some(BorderStyle::Inset),
+        "outset" => Some(BorderStyle::Outset),
+        "hidden" => Some(BorderStyle::Hidden),
+        _ => None,
+    }
 }

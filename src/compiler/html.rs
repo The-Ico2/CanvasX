@@ -12,8 +12,8 @@
 use crate::cxrd::document::{CxrdDocument, SceneType};
 use crate::cxrd::node::{CxrdNode, NodeKind, ImageFit, NodeId, EventBinding, EventAction};
 use crate::cxrd::input::{InputKind, TextInputType, ButtonVariant, CheckboxStyle};
-use crate::cxrd::style::{AlignItems, ComputedStyle, CursorStyle, Display, FlexDirection, FontWeight, TextAlign};
-use crate::cxrd::value::Dimension;
+use crate::cxrd::style::{AlignItems, Background, ComputedStyle, CursorStyle, Display, FlexDirection, FontWeight, TextAlign};
+use crate::cxrd::value::{Color, Dimension};
 use crate::compiler::css::{parse_css, apply_property, parse_color, CssRule, CompoundSelector};
 use std::collections::HashMap;
 use std::path::Path;
@@ -754,7 +754,11 @@ fn tokenize_html(source: &str) -> Vec<HtmlToken> {
                 while pos < bytes.len() && bytes[pos] != b'=' && !bytes[pos].is_ascii_whitespace() && bytes[pos] != b'>' && bytes[pos] != b'/' {
                     pos += 1;
                 }
-                let attr_name = source[attr_start..pos].to_lowercase();
+                // Preserve original casing for attribute names.
+                // SVG attributes like viewBox, preserveAspectRatio are case-sensitive
+                // in XML, while HTML attributes are case-insensitive. We store as-is
+                // and use case-insensitive lookups where needed.
+                let attr_name = source[attr_start..pos].to_string();
 
                 if pos < bytes.len() && bytes[pos] == b'=' {
                     pos += 1; // skip =
@@ -915,7 +919,8 @@ fn build_node_tree(tokens: &[HtmlToken], start: usize) -> (Vec<ParsedNode>, usiz
 }
 
 fn is_void_element(tag: &str) -> bool {
-    matches!(tag, "img" | "br" | "hr" | "input" | "meta" | "link" | "source" | "svg" | "path" | "line" | "circle" | "rect" | "polyline" | "ellipse" | "polygon")
+    matches!(tag, "img" | "br" | "hr" | "input" | "meta" | "link" | "source"
+        | "path" | "line" | "circle" | "rect" | "polyline" | "ellipse" | "polygon")
 }
 
 /// Info about an ancestor element, used for descendant selector matching.
@@ -935,6 +940,81 @@ fn add_node_recursive(
     ancestors: &[AncestorInfo],
     parent_style: Option<&ComputedStyle>,
 ) -> NodeId {
+    // ── SVG rasterization: convert <svg> elements to image nodes ──────
+    if parsed.tag == "svg" {
+        let current_color = parent_style.map(|ps| ps.color).unwrap_or(Color::WHITE);
+        if let Some(asset_idx) = rasterize_svg_node(doc, &parsed, &current_color) {
+            let kind = NodeKind::Image {
+                asset_index: asset_idx,
+                fit: ImageFit::Contain,
+            };
+
+            let mut style = ComputedStyle::default();
+            style.display = Display::InlineBlock;
+
+            // Inherit CSS properties from parent.
+            if let Some(ps) = parent_style {
+                style.color = ps.color;
+                style.font_size = ps.font_size;
+                style.font_family = ps.font_family.clone();
+                style.font_weight = ps.font_weight;
+                style.letter_spacing = ps.letter_spacing;
+                style.line_height = ps.line_height;
+                style.text_align = ps.text_align;
+                style.text_transform = ps.text_transform;
+            }
+
+            // Use SVG width/height as intrinsic dimensions.
+            if let Some(w) = parsed.attributes.get("width").and_then(|v| v.parse::<f32>().ok()) {
+                style.width = Dimension::Px(w);
+            }
+            if let Some(h) = parsed.attributes.get("height").and_then(|v| v.parse::<f32>().ok()) {
+                style.height = Dimension::Px(h);
+            }
+
+            // Wire the rasterized image into style.background so the
+            // paint system actually renders the texture.
+            style.background = Background::Image { asset_index: asset_idx };
+
+            let mut node = CxrdNode {
+                id: 0,
+                tag: Some("svg".to_string()),
+                html_id: parsed.id.clone(),
+                classes: parsed.classes.clone(),
+                attributes: parsed.attributes.clone(),
+                kind,
+                style,
+                children: Vec::new(),
+                events: extract_event_bindings(&parsed),
+                animations: Vec::new(),
+                layout: Default::default(),
+                hover_style: Vec::new(),
+                active_style: Vec::new(),
+                focus_style: Vec::new(),
+                hovered: false,
+                active: false,
+                focused: false,
+            };
+
+            // Apply CSS rules.
+            let html_id = parsed.id.clone();
+            apply_rules_to_node_with_ancestors(&mut node, &html_id, rules, variables, ancestors);
+
+            // Apply inline styles.
+            if !parsed.inline_style.is_empty() {
+                for decl in parsed.inline_style.split(';') {
+                    let decl = decl.trim();
+                    if let Some((prop, val)) = decl.split_once(':') {
+                        apply_property(&mut node.style, prop.trim(), val.trim(), variables);
+                    }
+                }
+            }
+
+            return doc.add_node(node);
+        }
+        // Fall through to normal handling if rasterization fails.
+    }
+
     let kind = determine_node_kind(&parsed, variables);
 
     // For widget elements, children are consumed by the widget (label, options, etc.)
@@ -1202,6 +1282,126 @@ fn extract_event_bindings(parsed: &ParsedNode) -> Vec<EventBinding> {
     }
 
     events
+}
+
+// ── SVG rasterization ──────────────────────────────────────────────────────
+
+/// Reconstruct SVG markup from a parsed `<svg>` node and its children.
+fn reconstruct_svg_markup(node: &ParsedNode) -> String {
+    let mut svg = String::with_capacity(512);
+    reconstruct_svg_element(&mut svg, node);
+    svg
+}
+
+fn reconstruct_svg_element(out: &mut String, node: &ParsedNode) {
+    if node.tag == "#text" {
+        if let Some(ref text) = node.text_content {
+            out.push_str(text);
+        }
+        return;
+    }
+
+    out.push('<');
+    out.push_str(&node.tag);
+
+    // For the root <svg>, ensure the xmlns attribute is present.
+    if node.tag == "svg" && !node.attributes.contains_key("xmlns") {
+        out.push_str(" xmlns=\"http://www.w3.org/2000/svg\"");
+    }
+
+    for (key, val) in &node.attributes {
+        // Skip class/id/style — they're CSS concerns, not SVG rendering.
+        if key == "class" || key == "id" || key == "style" { continue; }
+        out.push(' ');
+        out.push_str(key);
+        out.push_str("=\"");
+        out.push_str(val);
+        out.push('"');
+    }
+
+    if node.children.is_empty() && is_void_element(&node.tag) {
+        out.push_str(" />");
+    } else {
+        out.push('>');
+        for child in &node.children {
+            reconstruct_svg_element(out, child);
+        }
+        out.push_str("</");
+        out.push_str(&node.tag);
+        out.push('>');
+    }
+}
+
+/// Rasterize an SVG string to RGBA pixels using resvg.
+/// Returns (rgba_bytes, width, height) on success.
+fn rasterize_svg(svg_markup: &str, target_w: u32, target_h: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let options = resvg::usvg::Options::default();
+    let tree = match resvg::usvg::Tree::from_str(svg_markup, &options) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("[SVG] Failed to parse SVG: {}", e);
+            return None;
+        }
+    };
+
+    let tree_size = tree.size();
+    let svg_w = tree_size.width();
+    let svg_h = tree_size.height();
+    if svg_w <= 0.0 || svg_h <= 0.0 {
+        return None;
+    }
+
+    // Render at target size (or SVG intrinsic size if no target specified).
+    let render_w = if target_w > 0 { target_w } else { svg_w.ceil() as u32 };
+    let render_h = if target_h > 0 { target_h } else { svg_h.ceil() as u32 };
+    let render_w = render_w.max(1);
+    let render_h = render_h.max(1);
+
+    let scale_x = render_w as f32 / svg_w;
+    let scale_y = render_h as f32 / svg_h;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(render_w, render_h)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    // resvg outputs premultiplied RGBA; convert to straight alpha for GPU.
+    let mut rgba = pixmap.take();
+    for chunk in rgba.chunks_exact_mut(4) {
+        let a = chunk[3] as f32 / 255.0;
+        if a > 0.0 && a < 1.0 {
+            chunk[0] = (chunk[0] as f32 / a).min(255.0) as u8;
+            chunk[1] = (chunk[1] as f32 / a).min(255.0) as u8;
+            chunk[2] = (chunk[2] as f32 / a).min(255.0) as u8;
+        }
+    }
+
+    Some((rgba, render_w, render_h))
+}
+
+/// Rasterize an `<svg>` ParsedNode, add result as an image asset to the doc.
+/// Returns the asset index on success.
+fn rasterize_svg_node(doc: &mut CxrdDocument, parsed: &ParsedNode, current_color: &Color) -> Option<u32> {
+    let color_hex = current_color.to_hex_string();
+    let svg_markup = reconstruct_svg_markup(parsed).replace("currentColor", &color_hex);
+
+    // Parse target dimensions from width/height attributes (CSS may override later).
+    let target_w: u32 = parsed.attributes.get("width")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let target_h: u32 = parsed.attributes.get("height")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    // Render at 2x for crisp display on high-DPI screens.
+    let scale = 2u32;
+    let raster_w = if target_w > 0 { target_w * scale } else { 64 };
+    let raster_h = if target_h > 0 { target_h * scale } else { 64 };
+
+    let (rgba, w, h) = rasterize_svg(&svg_markup, raster_w, raster_h)?;
+
+    let name = format!("svg_raster_{}x{}", w, h);
+    let idx = doc.assets.add_raw_image(name, w, h, rgba);
+    Some(idx)
 }
 
 /// Determine the NodeKind from the HTML element.

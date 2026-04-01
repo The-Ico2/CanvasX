@@ -659,8 +659,42 @@ impl Renderer {
     /// Load all assets from a CXRD document into GPU textures.
     pub fn load_assets(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, assets: &crate::cxrd::asset::AssetBundle) {
         for (i, img) in assets.images.iter().enumerate() {
-            if let Err(e) = self.texture_manager.load_image_from_bytes(device, queue, i as u32, &img.data) {
-                log::warn!("Failed to load image asset '{}': {}", img.name, e);
+            let idx = i as u32;
+            let ok = if img.mime == "image/raw-rgba" {
+                // Pre-rasterized RGBA pixels (e.g., from SVG rasterization).
+                if img.width > 0 && img.height > 0 {
+                    self.texture_manager.update_texture(device, queue, idx, img.width, img.height, &img.data);
+                    true
+                } else { false }
+            } else {
+                match self.texture_manager.load_image_from_bytes(device, queue, idx, &img.data) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        log::warn!("Failed to load image asset '{}': {}", img.name, e);
+                        false
+                    }
+                }
+            };
+
+            // Create bind group so the texture can be sampled during rendering.
+            if ok {
+                if let Some(view) = self.texture_manager.try_get_view(idx) {
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("asset_texture_bg"),
+                        layout: &self.pipelines.texture_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    });
+                    self.texture_bind_groups.insert(idx, bg);
+                }
             }
         }
 

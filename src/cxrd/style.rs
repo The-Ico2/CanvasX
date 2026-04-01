@@ -7,6 +7,27 @@
 use serde::{Serialize, Deserialize};
 use crate::cxrd::value::{Color, Dimension, EdgeInsets, CornerRadii};
 
+/// Pseudo-class category for runtime behavior dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoClassCategory {
+    /// Requires mouse/keyboard/focus tracking (hover, active, focus, etc.).
+    Interactive,
+    /// Requires DOM tree position analysis (first-child, nth-child, etc.).
+    Structural,
+    /// Requires input/form element state tracking (checked, disabled, etc.).
+    FormState,
+    /// Requires link state tracking (link, visited, etc.).
+    LinkState,
+    /// Requires media/document state (fullscreen, playing, etc.).
+    MediaState,
+    /// Functional selectors (:is, :not, :has, :where).
+    Functional,
+    /// Element state / host / directionality / target.
+    ElementState,
+    /// Unrecognized pseudo-class.
+    Unknown,
+}
+
 /// Display mode for a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Display {

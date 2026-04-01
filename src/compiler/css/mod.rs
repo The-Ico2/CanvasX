@@ -13,15 +13,13 @@
 //   2. Add `CssLevel::Css4` variant to `version.rs`
 //   3. Add dispatch arm in `apply_property()` below
 
-pub mod version;
-pub mod css3;
+pub mod css;
 pub mod parsing;
 
 // Re-export commonly used items for backward compatibility.
 // Existing code that imports `crate::compiler::css::apply_property` etc. will
 // continue to work without changes.
-pub use parsing::{parse_color, parse_dimension, resolve_var_pub, parse_px};
-pub use version::{CssVersion, CssLevel, PseudoClassCategory};
+pub use parsing::{parse_color, resolve_var_pub};
 
 use crate::cxrd::style::*;
 use std::collections::HashMap;
@@ -99,29 +97,29 @@ pub fn apply_property(style: &mut ComputedStyle, property: &str, value: &str, va
     // Dispatch to CSS3 by default.
     // When CSS4 is added, this can accept a CssLevel parameter or be
     // configured at the document/compiler level.
-    if !css3::Css3::apply_property(style, property, value, variables) {
+    if !css::Css::apply_property(style, property, value, variables) {
         log::debug!("Unsupported CSS property: {}", property);
     }
 }
 
 /// Check whether a pseudo-class name is recognized by the active CSS version.
 pub fn is_pseudo_class(name: &str) -> bool {
-    css3::Css3::is_pseudo_class(name)
+    css::Css::is_pseudo_class(name)
 }
 
 /// Check whether a pseudo-element name is recognized by the active CSS version.
 pub fn is_pseudo_element(name: &str) -> bool {
-    css3::Css3::is_pseudo_element(name)
+    css::Css::is_pseudo_element(name)
 }
 
 /// Check whether an at-rule name is recognized by the active CSS version.
 pub fn is_at_rule(name: &str) -> bool {
-    css3::Css3::is_at_rule(name)
+    css::Css::is_at_rule(name)
 }
 
 /// Classify a pseudo-class for runtime behavior.
 pub fn pseudo_class_category(name: &str) -> PseudoClassCategory {
-    css3::Css3::pseudo_class_category(name)
+    css::Css::pseudo_class_category(name)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -112,6 +112,11 @@ impl TextureManager {
         &self.get(asset_index).view
     }
 
+    /// Get the texture view only if a non-default texture exists for this index.
+    pub fn try_get_view(&self, asset_index: u32) -> Option<&wgpu::TextureView> {
+        self.textures.get(&asset_index).map(|t| &t.view)
+    }
+
     fn create_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
