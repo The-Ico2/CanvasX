@@ -58,6 +58,13 @@ pub struct PrismConfig {
     #[serde(default)]
     pub theme: Option<String>,
 
+    /// Surface environment for this app: `"application"` (default),
+    /// `"desktop"`, `"overlay"`, or `"widget"`. Selects sensible window
+    /// defaults (decorations, transparency, AOT, etc.) and feeds the
+    /// PRISM DevTools badge visibility / capability defaults.
+    #[serde(default)]
+    pub environment: Option<String>,
+
     /// Right-click context menu customisation. The default menu (Inspect,
     /// DevTools, Pop-Out DevTools, Debug Server, Home, Back, Forward, Reload,
     /// Exit) is always available; this block lets a developer add custom

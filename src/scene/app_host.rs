@@ -275,6 +275,10 @@ impl AppHost {
     /// The environment seeds capability defaults, controls tray availability,
     /// and is exposed to scripts as `prism.env`.
     pub fn with_environment(title: impl Into<String>, env: Environment) -> Self {
+        let mut devtools = DevTools::new();
+        // Only Application surfaces wear the PRISM watermark; widgets,
+        // overlays, and desktop integrations stay branding-free.
+        devtools.show_badge = matches!(env, Environment::Application);
         Self {
             routes: Vec::new(),
             pages: HashMap::new(),
@@ -289,7 +293,7 @@ impl AppHost {
             pending_events: Vec::new(),
             shared_data: Arc::new(Mutex::new(HashMap::new())),
             capabilities: env.default_capabilities(),
-            devtools: DevTools::new(),
+            devtools,
             js_runtime: None,
             system_tray: None,
             tray_menu_html_path: None,

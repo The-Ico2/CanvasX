@@ -133,6 +133,10 @@ pub struct DevTools {
     pub elements_h_scroll_target: f32,
     /// Command palette (Ctrl+Shift+P) state.
     pub palette: palette::PaletteState,
+    /// When `false`, the corner "PRISM" badge is not rendered and is
+    /// not hit-testable. Set by hosts on non-Application environments
+    /// (overlay/widget/desktop) so widgets stay branding-free.
+    pub show_badge: bool,
 }
 
 impl DevTools {
@@ -177,6 +181,7 @@ impl DevTools {
             elements_scroll_target: 0.0,
             elements_h_scroll_target: 0.0,
             palette: palette::PaletteState::new(),
+            show_badge: true,
         }
     }
 
@@ -251,6 +256,7 @@ impl DevTools {
 
     /// Check if a click at (x, y) hits the OpenRender watermark badge.
     pub fn hit_test_badge(&self, x: f32, y: f32, viewport_width: f32, viewport_height: f32) -> bool {
+        if !self.show_badge { return false; }
         let (bx, by, bw, bh) = self.badge_rect(viewport_width, viewport_height);
         x >= bx && x <= bx + bw && y >= by && y <= by + bh
     }
@@ -736,7 +742,9 @@ impl DevTools {
     ) -> Vec<UiInstance> {
         let mut instances = Vec::new();
 
-        overlay::paint_badge(&mut instances, viewport_width, viewport_height);
+        if self.show_badge {
+            overlay::paint_badge(&mut instances, viewport_width, viewport_height);
+        }
 
         if self.open {
             overlay::paint_panel(
@@ -850,11 +858,19 @@ impl DevTools {
     ) -> Vec<DevToolsTextEntry> {
         let mut entries = Vec::new();
 
-        // Badge text "PRISM"
+        // Badge text "PRISM" — skipped on widget/overlay/desktop surfaces.
+        if !self.show_badge {
+            if self.open {
+                // Continue past the badge block to render the open panel.
+            } else {
+                return entries;
+            }
+        }
         let (bx, by, bw, bh) = self.badge_rect(viewport_width, viewport_height);
         let is_vertical = self.badge_rotation == 90 || self.badge_rotation == 270;
         let badge_color = Color::new(0.55, 0.71, 0.97, 0.65);
 
+        if self.show_badge {
         if is_vertical {
             let label = if self.badge_rotation == 270 {
                 "PRISM".to_string()
@@ -895,6 +911,7 @@ impl DevTools {
                 bold: false, clip: None,
             });
         }
+        } // end if self.show_badge
 
         if self.open {
             let panel_y = viewport_height - self.panel_height;

@@ -93,7 +93,7 @@ impl GpuContext {
             width,
             height,
             present_mode,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: pick_alpha_mode(&caps.alpha_modes),
             desired_maximum_frame_latency: 3,
             view_formats: vec![],
         };
@@ -228,5 +228,15 @@ impl GpuContext {
     pub fn current_texture(&self) -> Result<wgpu::SurfaceTexture, wgpu::SurfaceError> {
         self.surface.get_current_texture()
     }
+}
+
+/// Pick the best alpha mode for transparent-friendly rendering. Falls back
+/// to the platform default when no compositing-friendly mode is offered.
+fn pick_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMode {
+    use wgpu::CompositeAlphaMode::*;
+    for &m in &[PreMultiplied, PostMultiplied, Inherit] {
+        if modes.contains(&m) { return m; }
+    }
+    modes[0]
 }
 

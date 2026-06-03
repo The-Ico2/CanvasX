@@ -167,13 +167,10 @@ pub fn start() -> Result<(), StartError> {
     };
 
     // 7. Build the host.
-    let host = build_host(&cfg, caps, theme_css);
+    let env = parse_env(cfg.environment.as_deref());
+    let host = build_host(&cfg, caps, theme_css, env);
 
-    let opts = WindowOptions {
-        title: cfg.title.clone().unwrap_or_else(|| "Prism".into()),
-        width: cfg.window.as_ref().map(|w| w.width).unwrap_or(1024),
-        height: cfg.window.as_ref().map(|w| w.height).unwrap_or(768),
-    };
+    let opts = window_opts_for(&cfg, env);
 
     run::run_app(host, opts).map_err(|e| StartError::Run(e.to_string()))
 }
@@ -193,22 +190,47 @@ pub fn start_with(cfg: PrismConfig) -> Result<(), StartError> {
         if let Some(t) = cfg.theme.as_deref() { reg.set_active(t); }
         Some(reg.active_css())
     } else { None };
-    let host = build_host(&cfg, caps, theme_css);
-    let opts = WindowOptions {
+    let host = build_host(&cfg, caps, theme_css, parse_env(cfg.environment.as_deref()));
+    let opts = window_opts_for(&cfg, parse_env(cfg.environment.as_deref()));
+    run::run_app(host, opts).map_err(|e| StartError::Run(e.to_string()))
+}
+
+fn parse_env(s: Option<&str>) -> crate::env::Environment {
+    use crate::env::Environment;
+    match s.map(|x| x.to_ascii_lowercase()).as_deref() {
+        Some("desktop") => Environment::Desktop,
+        Some("overlay") => Environment::Overlay,
+        Some("widget")  => Environment::Widget,
+        _ => Environment::Application,
+    }
+}
+
+fn window_opts_for(cfg: &PrismConfig, env: crate::env::Environment) -> WindowOptions {
+    use crate::env::Environment;
+    let (decorations, transparent, aot, skip_tb) = match env {
+        Environment::Application => (true,  false, false, false),
+        Environment::Desktop     => (false, false, false, true),
+        Environment::Overlay     => (false, true,  true,  true),
+        Environment::Widget      => (false, true,  false, true),
+    };
+    WindowOptions {
         title: cfg.title.clone().unwrap_or_else(|| "Prism".into()),
         width: cfg.window.as_ref().map(|w| w.width).unwrap_or(1024),
         height: cfg.window.as_ref().map(|w| w.height).unwrap_or(768),
-    };
-    run::run_app(host, opts).map_err(|e| StartError::Run(e.to_string()))
+        transparent,
+        decorations,
+        always_on_top: aot,
+        skip_taskbar: skip_tb,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Internal: turn a PrismConfig into a populated AppHost using embedded pages.
 // ---------------------------------------------------------------------------
 
-fn build_host(cfg: &PrismConfig, caps: CapabilitySet, theme_css: Option<String>) -> AppHost {
+fn build_host(cfg: &PrismConfig, caps: CapabilitySet, theme_css: Option<String>, env: crate::env::Environment) -> AppHost {
     let title = cfg.title.clone().unwrap_or_else(|| "Prism".into());
-    let mut host = AppHost::new(&title);
+    let mut host = AppHost::with_environment(&title, env);
     host.set_capabilities(caps);
     host.set_theme_css(theme_css);
 

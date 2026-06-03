@@ -28,11 +28,30 @@ pub struct WindowOptions {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    /// Request a transparent backbuffer (and `body { background: transparent }`
+    /// flows through to the desktop). Combined with `decorations: false` this
+    /// gives a true see-through widget surface.
+    pub transparent: bool,
+    /// Show the OS-provided window chrome (caption, border). Disable for
+    /// frameless overlay/widget surfaces.
+    pub decorations: bool,
+    /// Pin the window above all other windows.
+    pub always_on_top: bool,
+    /// Hide the window from the taskbar (uses winit's skip_taskbar).
+    pub skip_taskbar: bool,
 }
 
 impl Default for WindowOptions {
     fn default() -> Self {
-        Self { title: "Prism".into(), width: 1024, height: 768 }
+        Self {
+            title: "Prism".into(),
+            width: 1024,
+            height: 768,
+            transparent: false,
+            decorations: true,
+            always_on_top: false,
+            skip_taskbar: false,
+        }
     }
 }
 
@@ -818,10 +837,18 @@ impl ApplicationHandler for HostedApp {
             return;
         }
 
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title(&self.opts.title)
             .with_inner_size(PhysicalSize::new(self.opts.width, self.opts.height))
-            .with_decorations(true);
+            .with_decorations(self.opts.decorations)
+            .with_transparent(self.opts.transparent);
+        if self.opts.always_on_top {
+            attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
+        }
+        if self.opts.skip_taskbar {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_skip_taskbar(true);
+        }
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
